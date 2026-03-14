@@ -51,6 +51,7 @@ sudo ./system_hardening.sh
 ## Checkmk Integration (All Profiles)
 
 The hardening script includes an optional Checkmk stage for every profile.
+For `tailscale-gateway`, Checkmk is handled inline in `system_hardening.sh` during the same wizard/apply flow.
 
 Supported paths:
 - Agent source:
@@ -87,6 +88,7 @@ If plaintext mode is chosen, the script prompts for source IP/CIDR restriction a
 
 ### `checkmk_setup.sh`
 Standalone Checkmk agent setup workflow for systems where you only want monitoring bootstrap.
+It is not required for `tailscale-gateway` when using `system_hardening.sh`, because that profile configures Checkmk inline.
 
 ### `declawer_v1.0.sh`
 Legacy hardening script retained for reference.

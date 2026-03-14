@@ -947,7 +947,7 @@ configure_tailscale_gateway_prompt() {
         TAILSCALE_STRONG_ADMIN_CHECK=0
     fi
 
-    if prompt_yes_no "Enable Checkmk integration?" "n"; then
+    if prompt_yes_no "Enable Checkmk integration inline in this hardening run? (no separate checkmk_setup.sh needed)" "n"; then
         TAILSCALE_ENABLE_CHECKMK_STEP=1
     else
         TAILSCALE_ENABLE_CHECKMK_STEP=0
@@ -1036,6 +1036,9 @@ configure_checkmk_prompt() {
     echo
     echo "=== Checkmk Integration (Optional) ==="
     echo "Prefer TLS where possible for Checkmk agent communication."
+    if [[ "${PROFILE}" == "tailscale-gateway" ]]; then
+        echo "For tailscale-gateway, Checkmk is handled in this wizard (no separate checkmk_setup.sh run required)."
+    fi
 
     if [[ "${PROFILE}" == "tailscale-gateway" ]]; then
         INSTALL_CHECKMK=1
