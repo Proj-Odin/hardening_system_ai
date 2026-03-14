@@ -19,6 +19,14 @@ log() { echo -e "\n==> $*"; }
 warn() { echo -e "\n[WARN] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+TMP_DEB=""
+cleanup() {
+  if [[ -n "${TMP_DEB}" && -f "${TMP_DEB}" ]]; then
+    rm -f -- "${TMP_DEB}"
+  fi
+}
+trap cleanup EXIT
+
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo -i)."; }
 has_apt() { command -v apt-get >/dev/null 2>&1 || die "This script expects Debian/Ubuntu (apt-get)."; }
 
@@ -92,11 +100,13 @@ if [[ "$agent_present" -eq 1 && "$FORCE_REINSTALL" != "1" ]]; then
   log "Checkmk agent already installed. Skipping installation."
 else
   log "Downloading and installing Checkmk agent..."
-  tmp_deb="/tmp/checkmk-agent.deb"
-  curl -fsSL "${CMK_AGENT_DEB_URL}" -o "$tmp_deb"
-  dpkg -i "$tmp_deb" || true
-  apt-get -f install -y
-  rm -f "$tmp_deb"
+  TMP_DEB="$(mktemp /tmp/checkmk-agent.XXXXXX.deb)"
+  curl -fsSL "${CMK_AGENT_DEB_URL}" -o "${TMP_DEB}"
+  if ! dpkg -i "${TMP_DEB}"; then
+    apt-get -f install -y
+  fi
+  rm -f -- "${TMP_DEB}"
+  TMP_DEB=""
 
   if ! command -v check_mk_agent >/dev/null 2>&1; then
     die "Checkmk agent installation failed"
@@ -231,5 +241,4 @@ echo
 echo "Quick checks:"
 echo "  check_mk_agent | head -20"
 echo "  ufw status | grep 6556"
-echo "==========================================================="</content>
-<parameter name="filePath">e:\Projects\hardening_system_ai\checkmk_setup.sh
+echo "==========================================================="

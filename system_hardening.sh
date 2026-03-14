@@ -680,6 +680,8 @@ configure_profile_prompt() {
     RUN_CERTBOT_NOW=0
     CERTBOT_DOMAIN=""
     CERTBOT_EMAIL=""
+    PROFILE_FIREWALL_RESTRICT_LAN=0
+    PROFILE_LAN_SOURCE=""
 
     case "${PROFILE}" in
         lan-only)
@@ -832,6 +834,8 @@ configure_tailscale_gateway_prompt() {
         TAILSCALE_PROFILE_ENABLED=1
     else
         TAILSCALE_PROFILE_ENABLED=0
+        TAILSCALE_ENABLE_CHECKMK_STEP=0
+        INSTALL_CHECKMK=0
         add_warning "Tailscale gateway profile was selected but disabled by operator."
         return
     fi
@@ -1298,6 +1302,13 @@ build_change_plan_preview() {
     esac
 }
 
+refresh_derived_review_state() {
+    # Rebuild derived state from current selections so summary/apply stay aligned.
+    build_ufw_rules_from_services
+    evaluate_remote_access_risk
+    build_change_plan_preview
+}
+
 show_summary() {
     local checkmk_tls_label="not applicable"
     local exposure_tls_label="not applicable"
@@ -1306,9 +1317,7 @@ show_summary() {
     local smb_tls_label="not applicable"
 
     # Compute derived state just before rendering review output.
-    build_ufw_rules_from_services
-    evaluate_remote_access_risk
-    build_change_plan_preview
+    refresh_derived_review_state
 
     echo
     echo "======================================================"
@@ -1385,6 +1394,7 @@ show_summary() {
             echo "  Tailscale SSH:         $([[ "${TAILSCALE_ENABLE_SSH}" -eq 1 ]] && echo "enabled" || echo "disabled")"
             echo "  Strong admin/root:     $([[ "${TAILSCALE_STRONG_ADMIN_CHECK}" -eq 1 ]] && echo "enabled" || echo "disabled")"
             echo "  Prefer TLS:            $([[ "${TAILSCALE_PREFER_TLS}" -eq 1 ]] && echo "yes" || echo "no")"
+            echo "  Apply runtime now:     $([[ "${TAILSCALE_RUN_UP_NOW}" -eq 1 ]] && echo "yes (tailscale up/serve/funnel attempted)" || echo "no (choices staged only)")"
             if [[ -n "${TAILSCALE_CUSTOM_PUBLISH_COMMAND}" ]]; then
                 echo "  Custom publish cmd:    ${TAILSCALE_CUSTOM_PUBLISH_COMMAND}"
             fi
@@ -1767,10 +1777,26 @@ apply_checkmk() {
             if [[ -z "${CHECKMK_AGENT_URL}" ]]; then
                 warn "No Checkmk .deb URL provided; skipping installation."
             else
-                local deb_path="/tmp/checkmk-agent.deb"
-                curl -fsSL "${CHECKMK_AGENT_URL}" -o "${deb_path}"
-                dpkg -i "${deb_path}" || apt-get -f install -y
-                rm -f "${deb_path}"
+                local deb_path
+                deb_path="$(mktemp /tmp/checkmk-agent.XXXXXX.deb)"
+
+                if ! curl -fsSL "${CHECKMK_AGENT_URL}" -o "${deb_path}"; then
+                    rm -f -- "${deb_path}"
+                    warn "Failed to download Checkmk .deb from URL."
+                    add_warning "Checkmk .deb download failed; agent install skipped."
+                    return
+                fi
+
+                if ! dpkg -i "${deb_path}"; then
+                    if ! apt-get -f install -y; then
+                        rm -f -- "${deb_path}"
+                        warn "Failed to install Checkmk agent dependencies after dpkg error."
+                        add_warning "Checkmk .deb install failed during dependency recovery."
+                        return
+                    fi
+                fi
+
+                rm -f -- "${deb_path}"
             fi
             ;;
         already)
@@ -2034,6 +2060,7 @@ apply_all_changes() {
     log "Starting apply phase"
 
     prepare_package_queue
+    refresh_derived_review_state
 
     run_cmd apt-get update
     install_queued_packages

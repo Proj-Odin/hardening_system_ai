@@ -338,6 +338,9 @@ else
 fi
 
 # ---------------- CHECKMK LOCAL CHECK (CurrentRun + NewDrives + per-drive verdicts) ----------------
+# Canonical installed local-check filename is `hdd_burnin_status`.
+# Legacy external aliases like `checkmk_localcheck_aborted_crit.sh` and
+# `heckmk_localcheck_aborted_crit_v1.sh` are not used by this installer.
 lc_dir="/usr/lib/check_mk_agent/local"
 lc_path="${lc_dir}/hdd_burnin_status"
 install -d -m 0755 "$lc_dir"
