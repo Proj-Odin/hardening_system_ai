@@ -8,6 +8,12 @@ set -Eeuo pipefail
 
 SCRIPT_VERSION="3.4-modular"
 
+# Script flow at a glance:
+# 1) Collect choices interactively by module.
+# 2) Build a dry-run style summary of planned rules/changes.
+# 3) Ask for final confirmation (apply/edit/cancel).
+# 4) Apply idempotent changes with backups and logging.
+
 # -------- Runtime State --------
 DISTRO=""
 DISTRO_VERSION=""
@@ -29,6 +35,8 @@ declare -a REMOTE_ACCESS_WARNINGS=()
 declare -a PLANNED_FILES=()
 declare -a PLANNED_SERVICES=()
 
+# REMOTE_ACCESS_RISK is a single summary flag used to print a final
+# "you could lose access" warning when high-risk SSH/firewall choices exist.
 REMOTE_ACCESS_RISK=0
 
 # -------- Profile Defaults --------
@@ -160,6 +168,7 @@ setup_runtime_paths() {
 }
 
 detect_environment() {
+    # /etc/os-release is the canonical source for distro detection.
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
@@ -184,6 +193,7 @@ detect_environment() {
         SSH_SERVICE="ssh"
     fi
 
+    # Read sshd's effective config so we detect non-default ports safely.
     if command -v sshd >/dev/null 2>&1; then
         CURRENT_SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')"
     fi
@@ -201,6 +211,7 @@ detect_environment() {
 }
 
 backup_config() {
+    # Backups are timestamped and mirrored by path under BACKUP_DIR.
     local file="$1"
     if [[ ! -f "${file}" ]]; then
         return 0
@@ -213,6 +224,7 @@ backup_config() {
 }
 
 write_file_with_backup() {
+    # Centralized "safe write" helper used by all managed config writes.
     local file="$1"
     backup_config "${file}"
     mkdir -p "$(dirname "${file}")"
@@ -317,6 +329,7 @@ prompt_input() {
 }
 
 prompt_menu() {
+    # Returns the numeric choice as stdout for easy command-substitution use.
     local title="$1"
     local default="$2"
     shift 2
@@ -342,6 +355,7 @@ prompt_menu() {
 }
 
 ssh_keys_appear_configured() {
+    # Safety check: we only suggest disabling password auth when keys appear present.
     local users=("root")
     local user home
 
@@ -394,6 +408,8 @@ add_ports_from_csv() {
 }
 
 add_ports_from_csv_scoped() {
+    # Accepts tokens like "443", "60000:60100", or "137/udp".
+    # For profile-scoped ports, optional LAN restriction is applied automatically.
     local csv="$1"
     local default_proto="${2:-tcp}"
     local scope="${3:-global}"
@@ -427,6 +443,7 @@ add_ports_from_csv_scoped() {
 }
 
 configure_profile_lan_scope_prompt() {
+    # Optional LAN-scoping is a defense-in-depth control for internal profiles.
     local default_choice="${1:-y}"
 
     PROFILE_FIREWALL_RESTRICT_LAN=0
@@ -490,6 +507,7 @@ select_profile() {
 }
 
 choose_profile() {
+    # Module alias kept for a clear top-level orchestration flow.
     select_profile
 }
 
@@ -549,6 +567,7 @@ configure_ssh_prompt() {
 }
 
 configure_ssh() {
+    # SSH is configured early so firewall decisions can safely allow the chosen port.
     configure_ssh_prompt
 }
 
@@ -556,6 +575,7 @@ configure_firewall_prompt() {
     echo
     echo "=== UFW Firewall ==="
 
+    # Reset planned rules each pass so "edit choices" behaves predictably.
     UFW_RULES=()
     CUSTOM_TCP_ENTRIES=""
     CUSTOM_UDP_ENTRIES=""
@@ -606,6 +626,7 @@ configure_firewall() {
 }
 
 configure_public_reverse_proxy() {
+    # This module intentionally does not open ports unless explicitly selected.
     if prompt_yes_no "Install Nginx + Certbot packages?" "y"; then
         INSTALL_NGINX=1
     else
@@ -643,6 +664,7 @@ configure_public_reverse_proxy() {
 }
 
 configure_tailscale_gateway() {
+    # Kept as a dedicated module wrapper for readability in the wizard flow.
     configure_tailscale_gateway_prompt
 }
 
@@ -650,6 +672,7 @@ configure_profile_prompt() {
     echo
     echo "=== Profile-Specific Options (${PROFILE}) ==="
 
+    # Reset profile-specific transient inputs so reruns/edit loops are safe.
     CUSTOM_PROFILE_PORTS=""
     CUSTOM_PROFILE_PACKAGES=""
     DOCKER_EXTRA_PORTS=""
@@ -788,6 +811,7 @@ configure_tailscale_gateway_prompt() {
     echo
     echo "=== Tailscale Gateway (Hardened Access Profile) ==="
 
+    # Baseline defaults are reinitialized on each run/edit cycle.
     INSTALL_TAILSCALE=1
     TAILSCALE_PUBLISH_MODE="serve"
     TAILSCALE_BACKEND_TYPE="local-web"
@@ -812,7 +836,7 @@ configure_tailscale_gateway_prompt() {
         return
     fi
 
-    # No public ports by default for this profile.
+    # No public ports by default for this profile. SSH is moved to tailscale0.
     remove_ufw_rule_exact "allow ${SSH_PORT}/tcp"
     remove_ufw_rule_exact "allow ${CURRENT_SSH_PORT}/tcp"
     remove_ufw_rule_exact "limit ${SSH_PORT}/tcp"
@@ -982,6 +1006,7 @@ configure_unattended_upgrades() {
 }
 
 configure_base_security() {
+    # Base security module groups host-wide controls (not role-specific services).
     echo
     echo "=== Base Security ==="
     configure_fail2ban
@@ -990,12 +1015,14 @@ configure_base_security() {
 }
 
 configure_security_services_prompt() {
+    # Backward-compatible alias kept during modular refactor.
     configure_base_security
 }
 
 configure_checkmk_prompt() {
     local comm_default="1"
 
+    # Reset Checkmk-specific transient values for rerun/edit safety.
     CHECKMK_ALLOW_FROM=""
     CHECKMK_SERVER=""
     CHECKMK_SITE="monitoring"
@@ -1035,6 +1062,8 @@ configure_checkmk_prompt() {
         3) CHECKMK_SOURCE="already" ;;
     esac
 
+    # If the operator disabled TLS preference for tailscale profile,
+    # default Checkmk choice to plaintext but still present TLS first.
     if [[ "${PROFILE}" == "tailscale-gateway" && "${TAILSCALE_PREFER_TLS}" -eq 0 ]]; then
         comm_default="2"
     fi
@@ -1088,6 +1117,8 @@ parse_custom_packages() {
 }
 
 build_ufw_rules_from_services() {
+    # Adds firewall rules implied by selected integrations (currently Checkmk).
+    # This runs before summary and apply so both views stay aligned.
     CHECKMK_EFFECTIVE_SOURCE="not-applicable"
 
     if [[ "${MANAGE_UFW}" -ne 1 ]]; then
@@ -1115,6 +1146,7 @@ build_ufw_rules_from_services() {
 }
 
 ensure_ssh_access_rule_present() {
+    # Hard safety guard: refuse firewall apply if SSH would become inaccessible.
     local has_ssh_access_rule=0
     local rule
 
@@ -1133,6 +1165,7 @@ ensure_ssh_access_rule_present() {
 }
 
 evaluate_remote_access_risk() {
+    # Aggregates human-facing warnings for risky SSH/firewall combinations.
     local rule
     local has_public_ssh_rule=0
     local has_tailscale_ssh_rule=0
@@ -1197,6 +1230,8 @@ add_planned_service() {
 }
 
 build_change_plan_preview() {
+    # Builds a preview list of files/services likely touched during apply.
+    # This is informational and intentionally conservative.
     PLANNED_FILES=()
     PLANNED_SERVICES=()
 
@@ -1267,6 +1302,7 @@ show_summary() {
     local docker_tls_label="not applicable"
     local smb_tls_label="not applicable"
 
+    # Compute derived state just before rendering review output.
     build_ufw_rules_from_services
     evaluate_remote_access_risk
     build_change_plan_preview
@@ -1495,6 +1531,7 @@ show_summary() {
 }
 
 review_summary() {
+    # Module alias for clearer high-level flow naming.
     show_summary
 }
 
@@ -1515,6 +1552,7 @@ install_queued_packages() {
 }
 
 prepare_package_queue() {
+    # Package queue is deduplicated so reruns do not cause noisy repeat installs.
     queue_package "openssh-server"
     queue_package "ufw"
     queue_package "ca-certificates"
@@ -1566,6 +1604,7 @@ prepare_package_queue() {
 }
 
 install_tailscale_package() {
+    # Tries distro package first; if unavailable, adds official Tailscale repo.
     if dpkg -s tailscale >/dev/null 2>&1; then
         log "Tailscale already installed"
         return 0
@@ -1590,6 +1629,7 @@ install_tailscale_package() {
 }
 
 apply_ssh_hardening() {
+    # SSH is validated with sshd -t before reload/restart to prevent lockout.
     log "Applying SSH hardening"
 
     local ssh_dropin="/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
@@ -1622,6 +1662,7 @@ apply_ufw() {
         return
     fi
 
+    # UFW defaults are strict: deny incoming, allow outgoing.
     log "Applying UFW policy"
     ensure_ssh_access_rule_present
     backup_config "/etc/ufw/user.rules"
@@ -1734,6 +1775,7 @@ apply_checkmk() {
             ;;
     esac
 
+    # TLS mode is preferred and avoids opening plain 6556 when possible.
     if [[ "${CHECKMK_COMM_MODE}" == "tls" ]]; then
         log "TLS mode selected for Checkmk communications"
         if command -v cmk-agent-ctl >/dev/null 2>&1; then
@@ -1762,6 +1804,7 @@ ensure_samba_include_dropin() {
 }
 
 build_tailscale_publish_target() {
+    # Build backend target URI used by tailscale serve/funnel apply logic.
     local scheme="http"
 
     case "${TAILSCALE_BACKEND_TYPE}" in
@@ -1787,6 +1830,7 @@ build_tailscale_publish_target() {
 }
 
 apply_tailscale_strong_admin_controls() {
+    # Optional stricter SSH policy drop-in for tailscale-gateway admin paths.
     local strict_file="/etc/ssh/sshd_config.d/98-tailscale-gateway-admin.conf"
 
     if [[ "${TAILSCALE_ENABLE_SSH}" -eq 1 && "${TAILSCALE_STRONG_ADMIN_CHECK}" -eq 1 ]]; then
@@ -1814,6 +1858,8 @@ EOF
 }
 
 apply_tailscale_gateway_profile() {
+    # Applies only tailscale-specific runtime actions. Core hardening still
+    # happens through global apply modules (SSH/UFW/Fail2Ban/etc).
     local publish_target
 
     if [[ "${TAILSCALE_PROFILE_ENABLED}" -ne 1 ]]; then
@@ -1916,6 +1962,7 @@ EOF
 }
 
 apply_profile_specific() {
+    # Role-specific runtime/config work that does not belong to global modules.
     case "${PROFILE}" in
         docker-host)
             if [[ "${INSTALL_DOCKER}" -eq 1 ]]; then
@@ -1979,6 +2026,8 @@ EOF
 }
 
 apply_all_changes() {
+    # Apply order matters:
+    # 1) install packages, 2) harden SSH, 3) enforce firewall, 4) security services.
     log "Starting apply phase"
 
     prepare_package_queue
@@ -1998,6 +2047,7 @@ apply_all_changes() {
 }
 
 apply_changes() {
+    # Module alias for high-level naming consistency.
     apply_all_changes
 }
 
@@ -2021,6 +2071,8 @@ print_post_apply() {
 }
 
 reset_wizard_review_state() {
+    # Clears derived/planned state before each wizard pass.
+    # This preserves safe rerun behavior when user chooses "edit choices".
     UFW_RULES=()
     SUMMARY_WARNINGS=()
     REMOTE_ACCESS_WARNINGS=()
@@ -2031,6 +2083,7 @@ reset_wizard_review_state() {
 }
 
 run_interactive_wizard() {
+    # Top-level configuration module sequence (interactive phase only).
     reset_wizard_review_state
     choose_profile
     configure_ssh
@@ -2041,6 +2094,7 @@ run_interactive_wizard() {
 }
 
 final_review_gate() {
+    # Review loop lets operator iterate safely before any mutating actions run.
     local review_choice
 
     while true; do
@@ -2068,6 +2122,7 @@ final_review_gate() {
 }
 
 main() {
+    # Entry point: detect environment, collect choices, review, then apply.
     require_root
     setup_runtime_paths
     detect_environment
