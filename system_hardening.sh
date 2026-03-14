@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # Safe, menu-driven, rerun-friendly hardening for homelab hosts
 # ============================================================
 
-SCRIPT_VERSION="3.3-interactive"
+SCRIPT_VERSION="3.4-modular"
 
 # -------- Runtime State --------
 DISTRO=""
@@ -489,6 +489,10 @@ select_profile() {
     log "Selected profile: ${PROFILE}"
 }
 
+choose_profile() {
+    select_profile
+}
+
 configure_ssh_prompt() {
     echo
     echo "=== SSH Hardening ==="
@@ -544,6 +548,10 @@ configure_ssh_prompt() {
     fi
 }
 
+configure_ssh() {
+    configure_ssh_prompt
+}
+
 configure_firewall_prompt() {
     echo
     echo "=== UFW Firewall ==="
@@ -591,6 +599,51 @@ configure_firewall_prompt() {
         read -r -p "Custom UDP ports/ranges (comma-separated, e.g., 53,60000:60100): " CUSTOM_UDP_ENTRIES
         add_ports_from_csv_scoped "${CUSTOM_UDP_ENTRIES}" "udp" "global"
     fi
+}
+
+configure_firewall() {
+    configure_firewall_prompt
+}
+
+configure_public_reverse_proxy() {
+    if prompt_yes_no "Install Nginx + Certbot packages?" "y"; then
+        INSTALL_NGINX=1
+    else
+        INSTALL_NGINX=0
+    fi
+
+    local web_choice
+    web_choice="$(prompt_menu "Public Web Exposure (explicitly select internet ports)" "1" \
+        "No public web ports right now (default)" \
+        "Allow HTTPS 443 only (recommended)" \
+        "Allow HTTP 80 + HTTPS 443 (weaker: includes non-TLS HTTP path)")"
+    case "${web_choice}" in
+        1)
+            PUBLIC_WEB_MODE="none"
+            add_warning "No public web ports selected for public-reverse-proxy."
+            ;;
+        2)
+            PUBLIC_WEB_MODE="https-only"
+            add_ufw_rule "allow 443/tcp"
+            ;;
+        3)
+            PUBLIC_WEB_MODE="http-https"
+            add_ufw_rule "allow 80/tcp"
+            add_ufw_rule "allow 443/tcp"
+            ;;
+    esac
+
+    if [[ "${INSTALL_NGINX}" -eq 1 ]] && [[ "${PUBLIC_WEB_MODE}" != "none" ]]; then
+        if prompt_yes_no "Attempt Certbot issuance now? (requires DNS already pointed)" "n"; then
+            RUN_CERTBOT_NOW=1
+            read -r -p "Certificate domain (FQDN): " CERTBOT_DOMAIN
+            read -r -p "Certificate email: " CERTBOT_EMAIL
+        fi
+    fi
+}
+
+configure_tailscale_gateway() {
+    configure_tailscale_gateway_prompt
 }
 
 configure_profile_prompt() {
@@ -702,44 +755,11 @@ configure_profile_prompt() {
             ;;
 
         public-reverse-proxy)
-            if prompt_yes_no "Install Nginx + Certbot packages?" "y"; then
-                INSTALL_NGINX=1
-            else
-                INSTALL_NGINX=0
-            fi
-
-            local web_choice
-            web_choice="$(prompt_menu "Public Web Exposure (explicitly select internet ports)" "1" \
-                "No public web ports right now (default)" \
-                "Allow HTTPS 443 only (recommended)" \
-                "Allow HTTP 80 + HTTPS 443 (weaker: includes non-TLS HTTP path)")"
-            case "${web_choice}" in
-                1)
-                    PUBLIC_WEB_MODE="none"
-                    add_warning "No public web ports selected for public-reverse-proxy."
-                    ;;
-                2)
-                    PUBLIC_WEB_MODE="https-only"
-                    add_ufw_rule "allow 443/tcp"
-                    ;;
-                3)
-                    PUBLIC_WEB_MODE="http-https"
-                    add_ufw_rule "allow 80/tcp"
-                    add_ufw_rule "allow 443/tcp"
-                    ;;
-            esac
-
-            if [[ "${INSTALL_NGINX}" -eq 1 ]] && [[ "${PUBLIC_WEB_MODE}" != "none" ]]; then
-                if prompt_yes_no "Attempt Certbot issuance now? (requires DNS already pointed)" "n"; then
-                    RUN_CERTBOT_NOW=1
-                    read -r -p "Certificate domain (FQDN): " CERTBOT_DOMAIN
-                    read -r -p "Certificate email: " CERTBOT_EMAIL
-                fi
-            fi
+            configure_public_reverse_proxy
             ;;
 
         tailscale-gateway)
-            configure_tailscale_gateway_prompt
+            configure_tailscale_gateway
             ;;
 
         custom)
@@ -927,16 +947,15 @@ configure_tailscale_gateway_prompt() {
     fi
 }
 
-configure_security_services_prompt() {
-    echo
-    echo "=== Security Services ==="
-
+configure_fail2ban() {
     if prompt_yes_no "Install/configure Fail2Ban? (recommended)" "y"; then
         INSTALL_FAIL2BAN=1
     else
         INSTALL_FAIL2BAN=0
     fi
+}
 
+configure_apparmor() {
     local apparmor_default="y"
     if [[ "${DISTRO}" == "debian" ]]; then
         apparmor_default="n"
@@ -946,7 +965,9 @@ configure_security_services_prompt() {
     else
         ENABLE_APPARMOR=0
     fi
+}
 
+configure_unattended_upgrades() {
     local update_choice
     update_choice="$(prompt_menu "Update Strategy" "1" \
         "Notifications only (manual patching)" \
@@ -958,6 +979,18 @@ configure_security_services_prompt() {
         2) UPDATE_MODE="unattended" ;;
         3) UPDATE_MODE="manual" ;;
     esac
+}
+
+configure_base_security() {
+    echo
+    echo "=== Base Security ==="
+    configure_fail2ban
+    configure_unattended_upgrades
+    configure_apparmor
+}
+
+configure_security_services_prompt() {
+    configure_base_security
 }
 
 configure_checkmk_prompt() {
@@ -1033,6 +1066,10 @@ configure_checkmk_prompt() {
             fi
             ;;
     esac
+}
+
+configure_checkmk() {
+    configure_checkmk_prompt
 }
 
 parse_custom_packages() {
@@ -1455,6 +1492,10 @@ show_summary() {
     fi
 
     echo "======================================================"
+}
+
+review_summary() {
+    show_summary
 }
 
 # -------- Apply Phase --------
@@ -1956,6 +1997,10 @@ apply_all_changes() {
     log "Hardening apply phase complete"
 }
 
+apply_changes() {
+    apply_all_changes
+}
+
 print_post_apply() {
     echo
     echo "======================================================"
@@ -1987,19 +2032,19 @@ reset_wizard_review_state() {
 
 run_interactive_wizard() {
     reset_wizard_review_state
-    select_profile
-    configure_ssh_prompt
-    configure_firewall_prompt
+    choose_profile
+    configure_ssh
+    configure_firewall
     configure_profile_prompt
-    configure_security_services_prompt
-    configure_checkmk_prompt
+    configure_base_security
+    configure_checkmk
 }
 
 final_review_gate() {
     local review_choice
 
     while true; do
-        show_summary
+        review_summary
 
         review_choice="$(prompt_menu "Final Review (no changes are applied yet)" "2" \
             "Confirm and apply changes" \
@@ -2037,7 +2082,7 @@ main() {
         exit 0
     fi
 
-    apply_all_changes
+    apply_changes
     print_post_apply
 }
 
