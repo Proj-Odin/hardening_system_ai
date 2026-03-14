@@ -2,14 +2,16 @@
 set -euo pipefail
 
 # ============================================================
-# Hardened Guest Bootstrap + OpenClaw Gateway
+# Hardened Guest Bootstrap + ZeroClaw Gateway
 # Target: Debian/Ubuntu guest VM/LXC (NOT Proxmox host)
 # ============================================================
+# ZeroClaw official site: https://www.zeroclawlabs.ai/
+# ZeroClaw official repo: https://github.com/zeroclaw-labs/zeroclaw
 
 # -------- Defaults (can be overridden via env) ---------------
 DEFAULT_SSH_PORT="${DEFAULT_SSH_PORT:-1492}"
-DEFAULT_OPENCLAW_PORT="${DEFAULT_OPENCLAW_PORT:-18789}"
-DEFAULT_OPENCLAW_BIND="${DEFAULT_OPENCLAW_BIND:-lan}"   # lan|loopback
+DEFAULT_ZEROCLAW_PORT="${DEFAULT_ZEROCLAW_PORT:-18789}"
+DEFAULT_ZEROCLAW_BIND="${DEFAULT_ZEROCLAW_BIND:-lan}"   # lan|loopback
 INSTALL_FAIL2BAN="${INSTALL_FAIL2BAN:-1}"
 INSTALL_UNATTENDED_UPGRADES="${INSTALL_UNATTENDED_UPGRADES:-1}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
@@ -98,7 +100,7 @@ write_sshd_dropin() {
   local ssh_port="$1"
   local drop="/etc/ssh/sshd_config.d/99-hardening.conf"
   cat > "${drop}" <<EOF
-# Managed by hardened-openclaw bootstrap
+# Managed by hardened-zeroclaw bootstrap
 Port ${ssh_port}
 
 PermitRootLogin no
@@ -165,7 +167,7 @@ if is_proxmox_host; then
 fi
 
 # -------- Logging (your addition) ---------------------------
-LOGFILE="/var/log/openclaw-install-$(timestamp).log"
+LOGFILE="/var/log/zeroclaw-install-$(timestamp).log"
 exec > >(tee -a "${LOGFILE}") 2>&1
 log "Logging to ${LOGFILE}"
 
@@ -174,8 +176,8 @@ export DEBIAN_FRONTEND=noninteractive
 # ------------------ Prompts (or env overrides) --------------
 SSH_PORT="${SSH_PORT:-}"
 LAN_CIDRS="${LAN_CIDRS:-}"
-OPENCLAW_PORT="${OPENCLAW_PORT:-}"
-OPENCLAW_BIND="${OPENCLAW_BIND:-}"
+ZEROCLAW_PORT="${ZEROCLAW_PORT:-}"
+ZEROCLAW_BIND="${ZEROCLAW_BIND:-}"
 ADMIN_USERS="${ADMIN_USERS:-}"
 
 DEFAULT_LAN_FALLBACK="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
@@ -197,13 +199,13 @@ prompt_if_needed() {
 
 prompt_if_needed SSH_PORT      "SSH port to configure"                 "${DEFAULT_SSH_PORT}"
 prompt_if_needed LAN_CIDRS     "Allowed LAN CIDR(s) (space/comma)"     "${DEFAULT_LAN}"
-prompt_if_needed OPENCLAW_PORT "OpenClaw gateway port"                 "${DEFAULT_OPENCLAW_PORT}"
-prompt_if_needed OPENCLAW_BIND "OpenClaw bind (lan|loopback)"          "${DEFAULT_OPENCLAW_BIND}"
+prompt_if_needed ZEROCLAW_PORT "ZeroClaw gateway port"                 "${DEFAULT_ZEROCLAW_PORT}"
+prompt_if_needed ZEROCLAW_BIND "ZeroClaw bind (lan|loopback)"          "${DEFAULT_ZEROCLAW_BIND}"
 prompt_if_needed ADMIN_USERS   "Comma-separated admin SSH usernames"   "admin"
 
 # -------- Port validation (your addition) -------------------
 validate_port "${SSH_PORT}"
-validate_port "${OPENCLAW_PORT}"
+validate_port "${ZEROCLAW_PORT}"
 
 # Normalize + validate LAN CIDRs
 LAN_CIDRS="$(normalize_list_unique "${LAN_CIDRS}")"
@@ -220,8 +222,8 @@ echo
 echo "=== Planned Settings ==="
 echo "SSH_PORT       : ${SSH_PORT}"
 echo "LAN_CIDRS      : ${LAN_CIDRS}"
-echo "OPENCLAW_PORT  : ${OPENCLAW_PORT}"
-echo "OPENCLAW_BIND  : ${OPENCLAW_BIND}"
+echo "ZEROCLAW_PORT  : ${ZEROCLAW_PORT}"
+echo "ZEROCLAW_BIND  : ${ZEROCLAW_BIND}"
 echo "ADMIN_USERS    : ${ADMIN_USERS}"
 echo "========================"
 echo
@@ -285,11 +287,11 @@ for u in "${ADMINS[@]}"; do
   passwd -l "${u}" >/dev/null 2>&1 || true
 done
 
-# ------------------ openclaw service user -------------------
-log "Creating openclaw service user (nologin + locked)..."
-id -u openclaw >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin openclaw
-passwd -l openclaw >/dev/null 2>&1 || true
-install -d -m 0700 -o openclaw -g openclaw /home/openclaw/.openclaw
+# ------------------ ZeroClaw service user -------------------
+log "Creating ZeroClaw service user (nologin + locked)..."
+id -u zeroclaw >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin zeroclaw
+passwd -l zeroclaw >/dev/null 2>&1 || true
+install -d -m 0700 -o zeroclaw -g zeroclaw /home/zeroclaw/.zeroclaw
 
 # ------------------ SSH hardening (drop-in) -----------------
 log "Hardening sshd via sshd_config.d drop-in (idempotent)..."
@@ -315,7 +317,7 @@ for cidr in ${LAN_CIDRS}; do
     [[ -n "${p}" ]] && ufw allow from "${cidr}" to any port "${p}" proto tcp || true
   done
 
-  ufw allow from "${cidr}" to any port "${OPENCLAW_PORT}" proto tcp
+  ufw allow from "${cidr}" to any port "${ZEROCLAW_PORT}" proto tcp
 done
 
 ufw --force enable
@@ -342,17 +344,17 @@ EOF
   systemctl restart fail2ban
 fi
 
-# ------------------ Node.js 22 + OpenClaw -------------------
+# ------------------ Node.js 22 + ZeroClaw -------------------
 install_node22_nodesource
 
-log "Installing OpenClaw CLI..."
-npm install -g openclaw@latest
-command -v openclaw >/dev/null
+log "Installing ZeroClaw CLI..."
+npm install -g zeroclaw@latest
+command -v zeroclaw >/dev/null
 
-# ------------------ OpenClaw config + systemd ---------------
-log "Configuring OpenClaw gateway service..."
-OC_STATE="/home/openclaw/.openclaw"
-OC_CFG="${OC_STATE}/openclaw.json"
+# ------------------ ZeroClaw config + systemd ---------------
+log "Configuring ZeroClaw gateway service..."
+OC_STATE="/home/zeroclaw/.zeroclaw"
+OC_CFG="${OC_STATE}/zeroclaw.json"
 OC_ENV="${OC_STATE}/.env"
 
 cat > "${OC_CFG}" <<'EOF'
@@ -362,32 +364,32 @@ cat > "${OC_CFG}" <<'EOF'
   }
 }
 EOF
-chown openclaw:openclaw "${OC_CFG}"
+chown zeroclaw:zeroclaw "${OC_CFG}"
 chmod 0600 "${OC_CFG}"
 
 # -------- Secure .env creation (your addition) --------------
 OC_TOKEN="$(openssl rand -hex 32)"
 ( umask 077 && cat >"${OC_ENV}" <<EOF
-OPENCLAW_GATEWAY_TOKEN=${OC_TOKEN}
+ZEROCLAW_GATEWAY_TOKEN=${OC_TOKEN}
 EOF
 )
-chown openclaw:openclaw "${OC_ENV}"
+chown zeroclaw:zeroclaw "${OC_ENV}"
 
-OPENCLAW_BIN="$(command -v openclaw)"
+ZEROCLAW_BIN="$(command -v zeroclaw)"
 
-cat > /etc/systemd/system/openclaw-gateway.service <<EOF
+cat > /etc/systemd/system/zeroclaw-gateway.service <<EOF
 [Unit]
-Description=OpenClaw Gateway
+Description=ZeroClaw Gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=openclaw
-Group=openclaw
-WorkingDirectory=/home/openclaw
+User=zeroclaw
+Group=zeroclaw
+WorkingDirectory=/home/zeroclaw
 EnvironmentFile=${OC_ENV}
-ExecStart=${OPENCLAW_BIN} gateway --port ${OPENCLAW_PORT} --bind ${OPENCLAW_BIND} --auth token --token \${OPENCLAW_GATEWAY_TOKEN} --verbose
+ExecStart=${ZEROCLAW_BIN} gateway --port ${ZEROCLAW_PORT} --bind ${ZEROCLAW_BIND} --auth token --token \${ZEROCLAW_GATEWAY_TOKEN} --verbose
 Restart=on-failure
 RestartSec=2
 UMask=0077
@@ -406,7 +408,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now openclaw-gateway
+systemctl enable --now zeroclaw-gateway
 
 # ------------------ Summary + quick checks ------------------
 log "Completed."
@@ -415,19 +417,21 @@ echo "==================== IMPORTANT OUTPUT ===================="
 echo "Log file          : ${LOGFILE}"
 echo "SSH port          : ${SSH_PORT}"
 echo "Allowed LAN CIDRs : ${LAN_CIDRS}"
-echo "OpenClaw port     : ${OPENCLAW_PORT}"
-echo "OpenClaw bind     : ${OPENCLAW_BIND}"
+echo "ZeroClaw port     : ${ZEROCLAW_PORT}"
+echo "ZeroClaw bind     : ${ZEROCLAW_BIND}"
 echo
-echo "OpenClaw token is stored here (root/openclaw-readable only):"
+echo "ZeroClaw token is stored here (root/zeroclaw-readable only):"
 echo "  ${OC_ENV}"
 echo "To view it:"
 echo "  sudo cat ${OC_ENV}"
 echo
 echo "Quick checks:"
-echo "  systemctl status openclaw-gateway --no-pager"
+echo "  systemctl status zeroclaw-gateway --no-pager"
 echo "  ufw status verbose"
 if [[ "${INSTALL_FAIL2BAN}" == "1" ]]; then
   echo "  fail2ban-client status"
   echo "  fail2ban-client status sshd"
 fi
 echo "=========================================================="
+
+
