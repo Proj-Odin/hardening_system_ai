@@ -1,0 +1,21 @@
+[PASS] All scripts syntax check 5/5 passed
+[PASS] Input file: lan 
+[PASS] Input file: docker 
+[PASS] Input file: fileserver 
+[PASS] Input file: tailscale 
+[PASS] Input file: webproxy 
+[PASS] Root check 
+[PASS] Log directory 
+[PASS] Backup setup 
+[PASS] SSH detection 
+[PASS] Error trap 
+[PASS] Profile selection 7/7 profiles
+[FAIL] UFW 
+[FAIL] Checkmk 
+[PASS] Declawer exit code 1 (fail-closed)
+[PASS] Artifact dirs created
+[PASS] Log file creation 
+[PASS] Backup structure 
+[PASS] Config variables 4/4 found
+[PASS] TODO file exists 
+[PASS] TODO test tasks 
