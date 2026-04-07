@@ -1,6 +1,6 @@
 # Homelab Hardening and Checkmk Scripts
 
-This repository contains interactive hardening and monitoring setup scripts for Debian/Ubuntu homelab servers.
+This repository contains interactive hardening and monitoring setup scripts for Debian/Ubuntu and Alpine homelab servers.
 
 ## Scripts
 
@@ -23,18 +23,38 @@ Usage:
 sudo ./system_hardening.sh
 ```
 
+### `system_hardening_alpine.sh`
+Interactive Alpine Linux hardening script with the same profile-driven flow as the Debian/Ubuntu build, adapted for `apk`, OpenRC-friendly service management, and Alpine package names.
+
+Usage:
+```bash
+apk add bash
+sudo ./system_hardening_alpine.sh
+```
+
+Convenience entry points:
+- `system_hardening_alpine_vm.sh` presets the Alpine target to `vm`
+- `system_hardening_alpine_lxc.sh` presets the Alpine target to `lxc`
+
+Alpine-specific notes:
+- The script asks for an Alpine target (`vm` or `lxc`) and changes defaults/warnings accordingly
+- LXC defaults are more conservative around UFW, Fail2Ban, AppArmor, Docker nesting, and kernel forwarding
+- APK update automation uses `/etc/periodic/daily/` + `crond` instead of `unattended-upgrades`
+- Checkmk integration keeps the same communication/firewall flow, but Alpine installation is manual by default or via a custom `.apk` URL
+
 ## Interactive Menu Flow
 
-1. Environment detection (Ubuntu/Debian, SSH service, current SSH port)
-2. Profile selection menu
-3. SSH hardening prompts
-4. Firewall prompts (UFW defaults + SSH safety + optional extras)
-5. Profile-specific prompts
-6. Security services prompts (Fail2Ban, AppArmor, update strategy)
-7. Optional Checkmk integration (TLS preferred vs legacy plaintext mode)
-8. Full summary and warning review
-9. Final apply confirmation
-10. Apply phase with logging and backups
+1. Environment detection (distro, init system, SSH service, current SSH port)
+2. Alpine target selection for the Alpine build (`vm` or `lxc`)
+3. Profile selection menu
+4. SSH hardening prompts
+5. Firewall prompts (UFW defaults + SSH safety + optional extras)
+6. Profile-specific prompts
+7. Security services prompts (Fail2Ban, AppArmor, update strategy)
+8. Optional Checkmk integration (TLS preferred vs legacy plaintext mode)
+9. Full summary and warning review
+10. Final apply confirmation
+11. Apply phase with logging and backups
 
 ## Profile Matrix
 
@@ -53,7 +73,7 @@ sudo ./system_hardening.sh
 The hardening script includes an optional Checkmk stage for every profile.
 For `tailscale-gateway`, Checkmk is handled inline in `system_hardening.sh` during the same wizard/apply flow.
 
-Supported paths:
+Supported paths in `system_hardening.sh`:
 - Agent source:
   - `apt` package (`check-mk-agent`)
   - direct `.deb` URL
@@ -64,6 +84,13 @@ Supported paths:
 
 If plaintext mode is chosen, the script prompts for source IP/CIDR restriction and adds matching UFW rules.
 
+For Alpine:
+- Agent source:
+  - manual install reminder only (recommended default)
+  - custom `.apk` URL (advanced)
+  - already installed
+- Communication mode remains the same: TLS preferred, plaintext optional with explicit UFW scoping
+
 ## Safety Guardrails
 
 - UFW default policy: deny incoming, allow outgoing
@@ -73,7 +100,7 @@ If plaintext mode is chosen, the script prompts for source IP/CIDR restriction a
 - Root SSH login disable option
 - Password SSH disable option only when key material is detected
 - Optional Fail2Ban (recommended)
-- Optional unattended-upgrades (interactive)
+- Optional automatic patching (interactive)
 - Optional AppArmor (interactive)
 - Summary + final confirmation required before apply
 
@@ -100,8 +127,10 @@ Burn-in and host setup scripts retained for specific workflows.
 
 - Debian (current supported releases)
 - Ubuntu (current supported releases)
+- Alpine Linux (VM and LXC-targeted Alpine entry points)
 
-`system_hardening.sh` auto-detects distro/service differences (for example SSH service naming).
+`system_hardening.sh` auto-detects Debian-family/service differences.
+`system_hardening_alpine.sh` is the Alpine-specific entry point and includes VM/LXC-aware defaults.
 
 ## License
 

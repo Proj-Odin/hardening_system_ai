@@ -2,11 +2,11 @@
 set -Eeuo pipefail
 
 # ============================================================
-# Interactive Homelab Hardening Script for Ubuntu/Debian
-# Safe, menu-driven, rerun-friendly hardening for homelab hosts
+# Interactive Homelab Hardening Script for Alpine Linux
+# Safe, menu-driven, rerun-friendly hardening for Alpine VM and LXC hosts
 # ============================================================
 
-SCRIPT_VERSION="3.4-modular"
+SCRIPT_VERSION="3.4-alpine"
 
 # Script flow at a glance:
 # 1) Collect choices interactively by module.
@@ -20,6 +20,9 @@ DISTRO_VERSION=""
 DISTRO_CODENAME=""
 SSH_SERVICE=""
 CURRENT_SSH_PORT="22"
+INIT_SYSTEM=""
+DEPLOYMENT_TARGET="${HARDENING_TARGET_PRESET:-}"
+DETECTED_VIRT="unknown"
 
 LOG_DIR="/var/log/homelab-hardening"
 BACKUP_ROOT="/var/backups/homelab-hardening"
@@ -60,7 +63,7 @@ ENABLE_APPARMOR=1
 UPDATE_MODE="notify" # notify|unattended|manual
 
 INSTALL_CHECKMK=0
-CHECKMK_SOURCE="apt" # apt|deb-url|already
+CHECKMK_SOURCE="manual" # manual|apk-url|already
 CHECKMK_AGENT_URL=""
 CHECKMK_COMM_MODE="tls" # tls|plaintext
 CHECKMK_SERVER=""
@@ -114,6 +117,11 @@ declare -A PROFILE_DESCRIPTIONS=(
     ["public-reverse-proxy"]="Internet-facing reverse proxy with HTTPS preference"
     ["tailscale-gateway"]="Identity-aware private gateway via Tailscale"
     ["custom"]="Build-your-own profile with explicit choices"
+)
+
+declare -A DEPLOYMENT_TARGET_DESCRIPTIONS=(
+    ["vm"]="Full Alpine VM with host-owned kernel/network stack"
+    ["lxc"]="Alpine LXC container with shared host kernel/capability limits"
 )
 
 # -------- Logging & Helpers --------
@@ -174,23 +182,41 @@ detect_environment() {
         . /etc/os-release
         DISTRO="${ID:-unknown}"
         DISTRO_VERSION="${VERSION_ID:-unknown}"
-        DISTRO_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+        DISTRO_CODENAME="${VERSION_CODENAME:-}"
     else
         die "Cannot detect distribution (missing /etc/os-release)."
     fi
 
-    if [[ "${DISTRO}" != "ubuntu" && "${DISTRO}" != "debian" ]]; then
-        if [[ "${ID_LIKE:-}" == *"debian"* ]]; then
-            DISTRO="debian-like"
-        else
-            die "This script supports Ubuntu and Debian only. Detected: ${DISTRO}"
+    if [[ "${DISTRO}" != "alpine" ]]; then
+        die "This script supports Alpine Linux only. Detected: ${DISTRO}"
+    fi
+
+    if command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    else
+        INIT_SYSTEM="none"
+    fi
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        DETECTED_VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+    fi
+    if [[ -z "${DETECTED_VIRT}" || "${DETECTED_VIRT}" == "none" ]]; then
+        DETECTED_VIRT="unknown"
+        if grep -qaE 'container=lxc|lxc' /proc/1/environ 2>/dev/null || \
+           grep -qaE '(^|/)lxc(/|$)' /proc/1/cgroup 2>/dev/null || \
+           [[ -f /dev/lxc ]]; then
+            DETECTED_VIRT="lxc"
+        elif grep -qaE '(^|/)docker(/|$)|(^|/)kubepods(/|$)' /proc/1/cgroup 2>/dev/null || [[ -f /.dockerenv ]]; then
+            DETECTED_VIRT="container"
         fi
     fi
 
-    if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "sshd.service"; then
+    if [[ "${INIT_SYSTEM}" == "systemd" ]] && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "sshd.service"; then
         SSH_SERVICE="sshd"
     else
-        SSH_SERVICE="ssh"
+        SSH_SERVICE="sshd"
     fi
 
     # Read sshd's effective config so we detect non-default ports safely.
@@ -200,14 +226,76 @@ detect_environment() {
     CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
     SSH_PORT="${CURRENT_SSH_PORT}"
 
-    if [[ "${DISTRO}" == "debian-like" ]]; then
-        log "Detected distribution: ${PRETTY_NAME:-unknown} (treated as Debian family)"
-    else
-        log "Detected distribution: ${DISTRO} ${DISTRO_VERSION}"
-    fi
+    log "Detected distribution: ${PRETTY_NAME:-${DISTRO} ${DISTRO_VERSION}}"
     log "Detected codename: ${DISTRO_CODENAME:-unknown}"
+    log "Init system: ${INIT_SYSTEM}"
+    log "Detected virtualization: ${DETECTED_VIRT}"
     log "SSH service name: ${SSH_SERVICE}"
     log "Current SSH port: ${CURRENT_SSH_PORT}"
+}
+
+service_exists() {
+    local service="$1"
+    case "${INIT_SYSTEM}" in
+        openrc)
+            rc-service -l 2>/dev/null | grep -qx "${service}"
+            ;;
+        systemd)
+            systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "${service}.service"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+enable_service_now() {
+    local service="$1"
+    case "${INIT_SYSTEM}" in
+        openrc)
+            rc-update add "${service}" default >/dev/null 2>&1 || true
+            if rc-service "${service}" status >/dev/null 2>&1; then
+                rc-service "${service}" restart
+            else
+                rc-service "${service}" start
+            fi
+            ;;
+        systemd)
+            systemctl enable --now "${service}"
+            ;;
+        *)
+            warn "No supported init system detected. Start '${service}' manually."
+            return 1
+            ;;
+    esac
+}
+
+reload_or_restart_service() {
+    local service="$1"
+    case "${INIT_SYSTEM}" in
+        openrc)
+            if rc-service "${service}" status >/dev/null 2>&1; then
+                rc-service "${service}" restart
+            else
+                rc-service "${service}" start
+            fi
+            ;;
+        systemd)
+            systemctl reload "${service}" || systemctl restart "${service}"
+            ;;
+        *)
+            warn "No supported init system detected. Restart '${service}' manually."
+            return 1
+            ;;
+    esac
+}
+
+post_apply_services_hint() {
+    case "${INIT_SYSTEM}" in
+        openrc) echo "rc-status -a" ;;
+        systemd) echo "systemctl --failed" ;;
+        *) echo "service manager unavailable; inspect processes manually" ;;
+    esac
 }
 
 backup_config() {
@@ -478,6 +566,45 @@ dedupe_ufw_rules() {
 }
 
 # -------- Interactive Wizard --------
+choose_deployment_target() {
+    local choice
+    local default_choice="1"
+
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" || "${DETECTED_VIRT}" == "lxc" || "${DETECTED_VIRT}" == "container" ]]; then
+        default_choice="2"
+    fi
+
+    if [[ -n "${HARDENING_TARGET_PRESET:-}" ]]; then
+        if [[ "${HARDENING_TARGET_PRESET}" != "vm" && "${HARDENING_TARGET_PRESET}" != "lxc" ]]; then
+            die "Invalid HARDENING_TARGET_PRESET value '${HARDENING_TARGET_PRESET}'. Use 'vm' or 'lxc'."
+        fi
+        DEPLOYMENT_TARGET="${HARDENING_TARGET_PRESET}"
+        log "Using preset deployment target: ${DEPLOYMENT_TARGET}"
+    else
+        echo
+        echo "=== Alpine Target ==="
+        if [[ "${DETECTED_VIRT}" != "unknown" ]]; then
+            echo "Detected virtualization hint: ${DETECTED_VIRT}"
+        fi
+
+        choice="$(prompt_menu "Deployment Target" "${default_choice}" \
+            "VM - ${DEPLOYMENT_TARGET_DESCRIPTIONS[vm]}" \
+            "LXC - ${DEPLOYMENT_TARGET_DESCRIPTIONS[lxc]}")"
+
+        case "${choice}" in
+            1) DEPLOYMENT_TARGET="vm" ;;
+            2) DEPLOYMENT_TARGET="lxc" ;;
+            *) die "Unexpected deployment target selection" ;;
+        esac
+    fi
+
+    log "Selected deployment target: ${DEPLOYMENT_TARGET}"
+
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+        add_warning "LXC target selected. Firewalling, AppArmor, Docker nesting, kernel forwarding, and some service actions may require extra container privileges or should be handled on the host."
+    fi
+}
+
 select_profile() {
     local options=(
         "lan-only - ${PROFILE_DESCRIPTIONS[lan-only]}"
@@ -574,14 +701,24 @@ configure_ssh() {
 configure_firewall_prompt() {
     echo
     echo "=== UFW Firewall ==="
+    local manage_default="y"
 
     # Reset planned rules each pass so "edit choices" behaves predictably.
     UFW_RULES=()
     CUSTOM_TCP_ENTRIES=""
     CUSTOM_UDP_ENTRIES=""
 
-    if prompt_yes_no "Manage UFW firewall in this run?" "y"; then
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+        manage_default="n"
+        echo "LXC note: UFW inside a container usually needs CAP_NET_ADMIN/privileged access."
+        echo "If your LXC host already handles filtering, leave this disabled here."
+    fi
+
+    if prompt_yes_no "Manage UFW firewall in this run?" "${manage_default}"; then
         MANAGE_UFW=1
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            add_warning "UFW selected inside LXC. This may fail or conflict with host-level firewalling unless the container has the needed network capabilities."
+        fi
     else
         MANAGE_UFW=0
         add_warning "UFW changes skipped by request."
@@ -700,8 +837,11 @@ configure_profile_prompt() {
         docker-host)
             configure_profile_lan_scope_prompt "y"
 
-            if prompt_yes_no "Install Docker packages ('docker.io' and compose plugin)?" "y"; then
+            if prompt_yes_no "Install Docker packages ('docker' and compose plugin)?" "$([[ "${DEPLOYMENT_TARGET}" == "lxc" ]] && echo "n" || echo "y")"; then
                 INSTALL_DOCKER=1
+                if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+                    add_warning "Docker-in-LXC selected. This usually needs nesting/privileged container settings and can be fragile on shared-kernel hosts."
+                fi
             else
                 INSTALL_DOCKER=0
                 add_warning "Docker profile selected but Docker package install disabled."
@@ -799,7 +939,7 @@ configure_profile_prompt() {
                 add_ports_from_csv_scoped "${CUSTOM_PROFILE_PORTS}" "udp" "profile"
             fi
 
-            read -r -p "Extra apt packages to install (CSV package names; blank for none): " CUSTOM_PROFILE_PACKAGES
+            read -r -p "Extra apk packages to install (CSV package names; blank for none): " CUSTOM_PROFILE_PACKAGES
             ;;
     esac
 }
@@ -832,6 +972,9 @@ configure_tailscale_gateway_prompt() {
 
     if prompt_yes_no "Enable Tailscale profile?" "y"; then
         TAILSCALE_PROFILE_ENABLED=1
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            add_warning "Tailscale in LXC may require /dev/net/tun and container capabilities approved by the host."
+        fi
     else
         TAILSCALE_PROFILE_ENABLED=0
         TAILSCALE_ENABLE_CHECKMK_STEP=0
@@ -921,6 +1064,9 @@ configure_tailscale_gateway_prompt() {
 
     if prompt_yes_no "Enable subnet routing?" "n"; then
         TAILSCALE_ENABLE_SUBNET_ROUTER=1
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            add_warning "Subnet routing inside LXC usually needs host-approved forwarding and extra container capabilities."
+        fi
         while true; do
             read -r -p "Which CIDRs to advertise? (comma-separated, explicit CIDRs only): " routes_input
             normalized_routes="$(validate_explicit_cidr_csv "${routes_input}" || true)"
@@ -976,20 +1122,28 @@ configure_tailscale_gateway_prompt() {
 }
 
 configure_fail2ban() {
-    if prompt_yes_no "Install/configure Fail2Ban? (recommended)" "y"; then
+    local default_choice="y"
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+        default_choice="n"
+    fi
+
+    if prompt_yes_no "Install/configure Fail2Ban? (recommended)" "${default_choice}"; then
         INSTALL_FAIL2BAN=1
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            add_warning "Fail2Ban in LXC depends on container firewall capabilities and may be less effective when the host owns packet filtering."
+        fi
     else
         INSTALL_FAIL2BAN=0
     fi
 }
 
 configure_apparmor() {
-    local apparmor_default="y"
-    if [[ "${DISTRO}" == "debian" ]]; then
-        apparmor_default="n"
-    fi
+    local apparmor_default="n"
     if prompt_yes_no "Enable AppArmor? (recommended when compatible with your workloads)" "${apparmor_default}"; then
         ENABLE_APPARMOR=1
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            add_warning "AppArmor selected in LXC. Container kernels typically inherit host LSM policy, so enable only if your host/container stack supports it."
+        fi
     else
         ENABLE_APPARMOR=0
     fi
@@ -997,9 +1151,9 @@ configure_apparmor() {
 
 configure_unattended_upgrades() {
     local update_choice
-    update_choice="$(prompt_menu "Update Strategy" "1" \
+    update_choice="$(prompt_menu "APK Update Strategy" "1" \
         "Notifications only (manual patching)" \
-        "Enable unattended-upgrades" \
+        "Enable daily automatic apk upgrades" \
         "Manual updates only")"
 
     case "${update_choice}" in
@@ -1040,6 +1194,7 @@ configure_checkmk_prompt() {
     echo
     echo "=== Checkmk Integration (Optional) ==="
     echo "Prefer TLS where possible for Checkmk agent communication."
+    echo "Alpine note: no native Checkmk agent package is assumed here, so installation is manual or via a custom .apk URL."
     if [[ "${PROFILE}" == "tailscale-gateway" ]]; then
         echo "For tailscale-gateway, Checkmk is handled in this wizard (no separate checkmk_setup.sh run required)."
     fi
@@ -1056,15 +1211,15 @@ configure_checkmk_prompt() {
 
     local src_choice
     src_choice="$(prompt_menu "Checkmk Agent Installation Source" "1" \
-        "Install from apt package ('check-mk-agent')" \
-        "Install from .deb URL" \
+        "Record manual install reminder only (recommended on Alpine)" \
+        "Install from custom .apk URL (advanced)" \
         "Agent already installed; configure comms only")"
 
     case "${src_choice}" in
-        1) CHECKMK_SOURCE="apt" ;;
+        1) CHECKMK_SOURCE="manual" ;;
         2)
-            CHECKMK_SOURCE="deb-url"
-            read -r -p "Enter Checkmk agent .deb URL: " CHECKMK_AGENT_URL
+            CHECKMK_SOURCE="apk-url"
+            read -r -p "Enter Checkmk agent .apk URL: " CHECKMK_AGENT_URL
             ;;
         3) CHECKMK_SOURCE="already" ;;
     esac
@@ -1243,6 +1398,7 @@ build_change_plan_preview() {
     PLANNED_SERVICES=()
 
     add_planned_file "/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
+    add_planned_file "/etc/ssh/sshd_config (include drop-in, if needed)"
     add_planned_service "${SSH_SERVICE} (reload/restart)"
 
     if [[ "${MANAGE_UFW}" -eq 1 ]]; then
@@ -1263,11 +1419,12 @@ build_change_plan_preview() {
 
     case "${UPDATE_MODE}" in
         notify)
-            add_planned_file "/etc/apticron/apticron.conf (if present)"
+            add_planned_file "/etc/periodic/daily/homelab-apk-notify"
+            add_planned_service "crond (enable/start)"
             ;;
         unattended)
-            add_planned_file "/etc/apt/apt.conf.d/20auto-upgrades"
-            add_planned_service "unattended-upgrades (reconfigure)"
+            add_planned_file "/etc/periodic/daily/homelab-apk-upgrade"
+            add_planned_service "crond (enable/start)"
             ;;
     esac
 
@@ -1281,8 +1438,7 @@ build_change_plan_preview() {
             if [[ "${INSTALL_SAMBA}" -eq 1 ]]; then
                 add_planned_file "/etc/samba/smb.conf.d/99-homelab-hardening.conf"
                 add_planned_file "/etc/samba/smb.conf (include drop-in, if needed)"
-                add_planned_service "smbd (enable/start)"
-                add_planned_service "nmbd (enable/start if available)"
+                add_planned_service "samba (enable/start)"
             fi
             ;;
         public-reverse-proxy)
@@ -1292,7 +1448,7 @@ build_change_plan_preview() {
             ;;
         tailscale-gateway)
             if [[ "${TAILSCALE_PROFILE_ENABLED}" -eq 1 ]]; then
-                add_planned_service "tailscaled (enable/start)"
+                add_planned_service "tailscale (enable/start)"
                 add_planned_file "/etc/ssh/sshd_config.d/98-tailscale-gateway-admin.conf (managed by strong-admin mode)"
                 if [[ "${TAILSCALE_ENABLE_SUBNET_ROUTER}" -eq 1 && -n "${TAILSCALE_ADVERTISE_ROUTES}" ]]; then
                     add_planned_file "/etc/sysctl.d/99-homelab-tailscale.conf"
@@ -1323,9 +1479,11 @@ show_summary() {
     echo "======================================================"
     echo "Planned Hardening Summary"
     echo "======================================================"
+    echo "Deployment target:       ${DEPLOYMENT_TARGET}"
     echo "Profile:                 ${PROFILE}"
     echo "Profile description:     ${PROFILE_DESCRIPTIONS[${PROFILE}]}"
     echo "Distribution:            ${DISTRO} ${DISTRO_VERSION} (${DISTRO_CODENAME:-unknown})"
+    echo "Init system:             ${INIT_SYSTEM}"
     echo "SSH service:             ${SSH_SERVICE}"
     echo "Log file:                ${LOGFILE}"
     echo "Backup directory:        ${BACKUP_DIR}"
@@ -1360,13 +1518,13 @@ show_summary() {
     echo "Security services:"
     echo "  Fail2Ban:              $([[ "${INSTALL_FAIL2BAN}" -eq 1 ]] && echo "install" || echo "skip")"
     echo "  AppArmor:              $([[ "${ENABLE_APPARMOR}" -eq 1 ]] && echo "enable" || echo "skip")"
-    echo "  Unattended-upgrades:   $([[ "${UPDATE_MODE}" == "unattended" ]] && echo "enabled" || echo "disabled")"
+    echo "  APK auto-upgrades:     $([[ "${UPDATE_MODE}" == "unattended" ]] && echo "enabled" || echo "disabled")"
     echo "  Update mode:           ${UPDATE_MODE}"
     echo
     echo "Checkmk:"
     echo "  Enabled:               $([[ "${INSTALL_CHECKMK}" -eq 1 ]] && echo "yes" || echo "no")"
     if [[ "${INSTALL_CHECKMK}" -eq 1 ]]; then
-        echo "  Source:                ${CHECKMK_SOURCE}"
+        echo "  Source:                ${CHECKMK_SOURCE} $([[ "${CHECKMK_SOURCE}" == "manual" ]] && echo "(manual install follow-up required)" || echo "")"
         echo "  Mode:                  ${CHECKMK_COMM_MODE}"
         echo "  Communication:         ${CHECKMK_COMM_MODE} $([[ "${CHECKMK_COMM_MODE}" == "plaintext" ]] && echo "(weaker mode)" || echo "")"
         if [[ "${CHECKMK_COMM_MODE}" == "tls" ]]; then
@@ -1571,7 +1729,7 @@ install_queued_packages() {
     fi
 
     log "Installing packages: ${PKG_QUEUE[*]}"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${PKG_QUEUE[@]}"
+    apk add "${PKG_QUEUE[@]}"
 }
 
 prepare_package_queue() {
@@ -1582,37 +1740,62 @@ prepare_package_queue() {
     queue_package "curl"
     queue_package "wget"
 
+    if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+        queue_package "openssh-server-common-openrc"
+        queue_package "ufw-openrc"
+    fi
+
     if [[ "${INSTALL_FAIL2BAN}" -eq 1 ]]; then
         queue_package "fail2ban"
+        if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+            queue_package "fail2ban-openrc"
+        fi
     fi
 
     if [[ "${ENABLE_APPARMOR}" -eq 1 ]]; then
         queue_package "apparmor"
         queue_package "apparmor-utils"
+        queue_package "apparmor-profiles"
+        if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+            queue_package "apparmor-openrc"
+        fi
     fi
 
     case "${UPDATE_MODE}" in
-        notify) queue_package "apticron" ;;
-        unattended) queue_package "unattended-upgrades" ;;
+        notify|unattended)
+            queue_package "cronie"
+            if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+                queue_package "cronie-openrc"
+            fi
+            ;;
     esac
 
     case "${PROFILE}" in
         docker-host)
             if [[ "${INSTALL_DOCKER}" -eq 1 ]]; then
-                queue_package "docker.io"
-                queue_package "docker-compose-plugin"
+                queue_package "docker"
+                queue_package "docker-cli-compose"
+                if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+                    queue_package "docker-openrc"
+                fi
             fi
             ;;
         file-server)
             if [[ "${INSTALL_SAMBA}" -eq 1 ]]; then
                 queue_package "samba"
+                if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+                    queue_package "samba-server-openrc"
+                fi
             fi
             ;;
         public-reverse-proxy)
             if [[ "${INSTALL_NGINX}" -eq 1 ]]; then
                 queue_package "nginx"
                 queue_package "certbot"
-                queue_package "python3-certbot-nginx"
+                queue_package "certbot-nginx"
+                if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+                    queue_package "nginx-openrc"
+                fi
             fi
             ;;
         custom)
@@ -1627,28 +1810,33 @@ prepare_package_queue() {
 }
 
 install_tailscale_package() {
-    # Tries distro package first; if unavailable, adds official Tailscale repo.
-    if dpkg -s tailscale >/dev/null 2>&1; then
+    if apk info -e tailscale >/dev/null 2>&1; then
         log "Tailscale already installed"
         return 0
     fi
 
-    if apt-cache policy tailscale 2>/dev/null | grep -q "Candidate: (none)"; then
-        if [[ -z "${DISTRO_CODENAME}" ]]; then
-            warn "Cannot infer distro codename for Tailscale repo setup."
-            return 1
-        fi
+    log "Installing tailscale from Alpine repositories"
+    apk add tailscale
+    if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+        apk add tailscale-openrc >/dev/null 2>&1 || true
+    fi
+}
 
-        log "Adding official Tailscale apt repository for ${DISTRO_CODENAME}"
-        backup_config "/etc/apt/sources.list.d/tailscale.list"
-        curl -fsSL "https://pkgs.tailscale.com/stable/${DISTRO_CODENAME}.noarmor.gpg" \
-            -o /usr/share/keyrings/tailscale-archive-keyring.gpg
-        curl -fsSL "https://pkgs.tailscale.com/stable/${DISTRO_CODENAME}.tailscale-keyring.list" \
-            -o /etc/apt/sources.list.d/tailscale.list
-        apt-get update
+ensure_sshd_include_dropin() {
+    local main_cfg="/etc/ssh/sshd_config"
+    local include_line="Include /etc/ssh/sshd_config.d/*.conf"
+
+    if [[ ! -f "${main_cfg}" ]]; then
+        return
     fi
 
-    apt-get install -y tailscale
+    mkdir -p /etc/ssh/sshd_config.d
+
+    if ! grep -Eq '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$' "${main_cfg}"; then
+        backup_config "${main_cfg}"
+        printf "%s\n\n%s\n" "${include_line}" "$(cat "${main_cfg}")" > "${main_cfg}"
+        log "Added SSH include for /etc/ssh/sshd_config.d/*.conf"
+    fi
 }
 
 apply_ssh_hardening() {
@@ -1656,6 +1844,7 @@ apply_ssh_hardening() {
     log "Applying SSH hardening"
 
     local ssh_dropin="/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
+    ensure_sshd_include_dropin
 
     write_file_with_backup "${ssh_dropin}" <<EOF
 # Managed by homelab hardening script (${SCRIPT_VERSION})
@@ -1675,7 +1864,7 @@ EOF
         die "sshd configuration validation failed. SSH config was not applied safely."
     fi
 
-    systemctl reload "${SSH_SERVICE}" || systemctl restart "${SSH_SERVICE}"
+    enable_service_now "${SSH_SERVICE}" || warn "SSH service restart needs manual follow-up."
     log "SSH service reloaded successfully"
 }
 
@@ -1692,20 +1881,36 @@ apply_ufw() {
     backup_config "/etc/ufw/user6.rules"
     backup_config "/etc/default/ufw"
 
-    if [[ "${RESET_UFW}" -eq 1 ]]; then
-        run_cmd_quiet ufw --force reset
+    if ! command -v ufw >/dev/null 2>&1; then
+        warn "ufw command not found after package install. Skipping firewall apply."
+        return
     fi
 
-    run_cmd_quiet ufw default deny incoming
-    run_cmd_quiet ufw default allow outgoing
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+        warn "Applying UFW inside LXC. This will fail unless the container has the required netfilter capabilities."
+    fi
 
-    local rule
-    for rule in "${UFW_RULES[@]}"; do
-        # shellcheck disable=SC2086
-        run_cmd_quiet ufw ${rule}
-    done
+    if ! {
+        if [[ "${RESET_UFW}" -eq 1 ]]; then
+            run_cmd_quiet ufw --force reset
+        fi
 
-    run_cmd_quiet ufw --force enable
+        run_cmd_quiet ufw default deny incoming
+        run_cmd_quiet ufw default allow outgoing
+
+        local rule
+        for rule in "${UFW_RULES[@]}"; do
+            # shellcheck disable=SC2086
+            run_cmd_quiet ufw ${rule}
+        done
+
+        run_cmd_quiet ufw --force enable
+        if service_exists "ufw"; then
+            enable_service_now "ufw" || warn "Failed to enable/start ufw service."
+        fi
+    }; then
+        warn "UFW apply failed. Review container privileges or host firewall ownership before retrying."
+    fi
 }
 
 apply_fail2ban() {
@@ -1723,7 +1928,7 @@ findtime = 10m
 bantime = 1h
 EOF
 
-    systemctl enable --now fail2ban
+    enable_service_now "fail2ban" || warn "Failed to enable/start Fail2Ban automatically."
 }
 
 apply_apparmor() {
@@ -1732,8 +1937,17 @@ apply_apparmor() {
     fi
 
     log "Ensuring AppArmor is enabled"
-    if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "apparmor.service"; then
-        systemctl enable --now apparmor
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+        warn "Skipping AppArmor enable inside LXC unless you explicitly manage LSM support at the host level."
+        return
+    fi
+
+    if [[ -f /sys/kernel/security/lsm ]] && ! grep -qw "apparmor" /sys/kernel/security/lsm 2>/dev/null; then
+        warn "Kernel AppArmor support does not appear active. Enable the AppArmor LSM before relying on this setting."
+    fi
+
+    if service_exists "apparmor"; then
+        enable_service_now "apparmor" || warn "Failed to enable/start AppArmor automatically."
     else
         warn "AppArmor service not found. Kernel/userland support may be missing."
     fi
@@ -1742,22 +1956,25 @@ apply_apparmor() {
 apply_update_mode() {
     case "${UPDATE_MODE}" in
         notify)
-            log "Configuring apticron (notification-only updates)"
-            if [[ -f /etc/apticron/apticron.conf ]]; then
-                backup_config "/etc/apticron/apticron.conf"
-                sed -i 's/^EMAIL=.*/EMAIL="root"/' /etc/apticron/apticron.conf || true
-                sed -i 's/^NOTIFY_NO_UPDATES=.*/NOTIFY_NO_UPDATES="0"/' /etc/apticron/apticron.conf || true
-            fi
+            log "Configuring daily apk update notifications"
+            mkdir -p /etc/periodic/daily
+            write_file_with_backup "/etc/periodic/daily/homelab-apk-notify" <<'EOF'
+#!/bin/sh
+apk update >/dev/null 2>&1
+apk version -l '<' > /var/log/homelab-hardening/apk-updates-pending.log 2>/dev/null || true
+EOF
+            chmod 0755 /etc/periodic/daily/homelab-apk-notify
+            enable_service_now "crond" || warn "Failed to enable/start crond for apk notifications."
             ;;
         unattended)
-            log "Configuring unattended-upgrades"
-            write_file_with_backup "/etc/apt/apt.conf.d/20auto-upgrades" <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
-APT::Periodic::AutocleanInterval "7";
-APT::Periodic::Unattended-Upgrade "1";
+            log "Configuring daily automatic apk upgrades"
+            mkdir -p /etc/periodic/daily
+            write_file_with_backup "/etc/periodic/daily/homelab-apk-upgrade" <<'EOF'
+#!/bin/sh
+apk update && apk upgrade
 EOF
-            dpkg-reconfigure -f noninteractive unattended-upgrades || warn "dpkg-reconfigure unattended-upgrades failed"
+            chmod 0755 /etc/periodic/daily/homelab-apk-upgrade
+            enable_service_now "crond" || warn "Failed to enable/start crond for apk upgrades."
             ;;
         manual)
             log "Manual update mode selected; no automation configured"
@@ -1773,39 +1990,32 @@ apply_checkmk() {
     log "Applying Checkmk integration"
 
     case "${CHECKMK_SOURCE}" in
-        apt)
-            if ! dpkg -s check-mk-agent >/dev/null 2>&1; then
-                if ! apt-get install -y check-mk-agent; then
-                    warn "Failed to install check-mk-agent from apt."
-                    add_warning "Checkmk agent installation failed from apt."
-                    return
-                fi
-            fi
+        manual)
+            warn "Checkmk agent install is manual on Alpine by default. No package install was attempted."
+            add_warning "Checkmk agent installation still needs manual completion on Alpine."
             ;;
-        deb-url)
+        apk-url)
             if [[ -z "${CHECKMK_AGENT_URL}" ]]; then
-                warn "No Checkmk .deb URL provided; skipping installation."
+                warn "No Checkmk .apk URL provided; skipping installation."
             else
-                local deb_path
-                deb_path="$(mktemp /tmp/checkmk-agent.XXXXXX.deb)"
+                local apk_path
+                apk_path="$(mktemp /tmp/checkmk-agent.XXXXXX.apk)"
 
-                if ! curl -fsSL "${CHECKMK_AGENT_URL}" -o "${deb_path}"; then
-                    rm -f -- "${deb_path}"
-                    warn "Failed to download Checkmk .deb from URL."
-                    add_warning "Checkmk .deb download failed; agent install skipped."
+                if ! curl -fsSL "${CHECKMK_AGENT_URL}" -o "${apk_path}"; then
+                    rm -f -- "${apk_path}"
+                    warn "Failed to download Checkmk .apk from URL."
+                    add_warning "Checkmk .apk download failed; agent install skipped."
                     return
                 fi
 
-                if ! dpkg -i "${deb_path}"; then
-                    if ! apt-get -f install -y; then
-                        rm -f -- "${deb_path}"
-                        warn "Failed to install Checkmk agent dependencies after dpkg error."
-                        add_warning "Checkmk .deb install failed during dependency recovery."
-                        return
-                    fi
+                if ! apk add --allow-untrusted "${apk_path}"; then
+                    rm -f -- "${apk_path}"
+                    warn "Failed to install Checkmk agent from .apk URL."
+                    add_warning "Checkmk .apk install failed."
+                    return
                 fi
 
-                rm -f -- "${deb_path}"
+                rm -f -- "${apk_path}"
             fi
             ;;
         already)
@@ -1880,7 +2090,7 @@ KbdInteractiveAuthentication no
 EOF
 
         if sshd -t; then
-            systemctl reload "${SSH_SERVICE}" || systemctl restart "${SSH_SERVICE}"
+            reload_or_restart_service "${SSH_SERVICE}" || warn "Failed to reload SSH after Tailscale strong-admin controls."
         else
             warn "Strong admin SSH controls failed validation; keeping prior SSH runtime config."
         fi
@@ -1889,7 +2099,7 @@ EOF
             backup_config "${strict_file}"
             rm -f "${strict_file}"
             if sshd -t; then
-                systemctl reload "${SSH_SERVICE}" || systemctl restart "${SSH_SERVICE}"
+                reload_or_restart_service "${SSH_SERVICE}" || warn "Failed to reload SSH after removing Tailscale strong-admin controls."
             fi
         fi
     fi
@@ -1913,7 +2123,13 @@ apply_tailscale_gateway_profile() {
     fi
 
     if command -v tailscale >/dev/null 2>&1; then
-        systemctl enable --now tailscaled || warn "Failed to enable tailscaled service"
+        if service_exists "tailscale"; then
+            enable_service_now "tailscale" || warn "Failed to enable/start tailscale service"
+        elif service_exists "tailscaled"; then
+            enable_service_now "tailscaled" || warn "Failed to enable/start tailscaled service"
+        else
+            warn "No tailscale OpenRC/systemd service detected. Start tailscaled manually if needed."
+        fi
     else
         warn "tailscale binary not found; cannot apply gateway runtime settings."
         return
@@ -1922,6 +2138,8 @@ apply_tailscale_gateway_profile() {
     if [[ "${TAILSCALE_ENABLE_SUBNET_ROUTER}" -eq 1 ]]; then
         if [[ -z "${TAILSCALE_ADVERTISE_ROUTES}" ]]; then
             warn "Subnet routing requested but no explicit CIDRs were provided. Skipping route advertisement."
+        elif [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            warn "Skipping sysctl forwarding changes inside LXC. Enable forwarding on the host/container config before advertising routes."
         else
             write_file_with_backup "/etc/sysctl.d/99-homelab-tailscale.conf" <<'EOF'
 net.ipv4.ip_forward = 1
@@ -2004,7 +2222,7 @@ apply_profile_specific() {
     case "${PROFILE}" in
         docker-host)
             if [[ "${INSTALL_DOCKER}" -eq 1 ]]; then
-                systemctl enable --now docker || warn "Failed to enable Docker service"
+                enable_service_now "docker" || warn "Failed to enable/start Docker service"
                 if [[ "${DOCKER_OPEN_TLS_API}" -eq 1 ]]; then
                     log "Docker TLS API exposure selected (manual daemon TLS cert configuration still required)"
                 fi
@@ -2022,9 +2240,15 @@ EOF
                 if command -v testparm >/dev/null 2>&1; then
                     testparm -s >/dev/null
                 fi
-                systemctl enable --now smbd || warn "Failed to enable smbd"
-                if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "nmbd.service"; then
-                    systemctl enable --now nmbd || warn "Failed to enable nmbd"
+                if service_exists "samba"; then
+                    enable_service_now "samba" || warn "Failed to enable/start samba"
+                elif service_exists "smbd"; then
+                    enable_service_now "smbd" || warn "Failed to enable/start smbd"
+                    if service_exists "nmbd"; then
+                        enable_service_now "nmbd" || warn "Failed to enable/start nmbd"
+                    fi
+                else
+                    warn "No Samba service detected. Start it manually after validating smb.conf."
                 fi
             fi
             ;;
@@ -2039,7 +2263,7 @@ EOF
 
         public-reverse-proxy)
             if [[ "${INSTALL_NGINX}" -eq 1 ]]; then
-                systemctl enable --now nginx || warn "Failed to enable Nginx"
+                enable_service_now "nginx" || warn "Failed to enable/start Nginx"
             fi
 
             if [[ "${RUN_CERTBOT_NOW}" -eq 1 ]]; then
@@ -2071,7 +2295,7 @@ apply_all_changes() {
     prepare_package_queue
     refresh_derived_review_state
 
-    run_cmd apt-get update
+    run_cmd apk update
     install_queued_packages
 
     apply_ssh_hardening
@@ -2091,10 +2315,14 @@ apply_changes() {
 }
 
 print_post_apply() {
+    local service_hint
+    service_hint="$(post_apply_services_hint)"
+
     echo
     echo "======================================================"
     echo "Hardening Complete"
     echo "======================================================"
+    echo "Deployment target: ${DEPLOYMENT_TARGET}"
     echo "Profile:          ${PROFILE}"
     echo "Log file:         ${LOGFILE}"
     echo "Backup directory: ${BACKUP_DIR}"
@@ -2102,7 +2330,7 @@ print_post_apply() {
     echo "Next checks:"
     echo "1) Verify SSH login in a second session before closing this one."
     echo "2) Run: ufw status verbose"
-    echo "3) Run: systemctl --failed"
+    echo "3) Run: ${service_hint}"
     if [[ "${INSTALL_CHECKMK}" -eq 1 && "${CHECKMK_COMM_MODE}" == "tls" ]]; then
         echo "4) Complete Checkmk TLS registration (cmk-agent-ctl register)."
     fi
@@ -2124,6 +2352,7 @@ reset_wizard_review_state() {
 run_interactive_wizard() {
     # Top-level configuration module sequence (interactive phase only).
     reset_wizard_review_state
+    choose_deployment_target
     choose_profile
     configure_ssh
     configure_firewall
@@ -2166,8 +2395,8 @@ main() {
     setup_runtime_paths
     detect_environment
 
-    echo "Homelab Hardening Script v${SCRIPT_VERSION}"
-    echo "Safe defaults, interactive prompts, and rollback-friendly backups"
+    echo "Homelab Hardening Script for Alpine v${SCRIPT_VERSION}"
+    echo "Safe defaults, interactive prompts, and rollback-friendly backups for Alpine VM/LXC hosts"
 
     run_interactive_wizard
 
