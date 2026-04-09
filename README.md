@@ -41,6 +41,8 @@ Alpine-specific notes:
 - LXC defaults are more conservative around UFW, Fail2Ban, AppArmor, Docker nesting, and kernel forwarding
 - APK update automation uses `/etc/periodic/daily/` + `crond` instead of `unattended-upgrades`
 - Checkmk integration keeps the same communication/firewall flow, but Alpine installation is manual by default or via a custom `.apk` URL
+- Shared wizard/apply behavior should stay mirrored with `system_hardening.sh` unless Alpine package, init, service, or VM/LXC constraints require a distro-specific branch
+- Run `python verify_hardening_sync.py` after shared hardening changes to catch accidental drift
 
 ## Interactive Menu Flow
 

@@ -13,6 +13,10 @@ SCRIPT_VERSION="3.4-alpine"
 # 2) Build a dry-run style summary of planned rules/changes.
 # 3) Ask for final confirmation (apply/edit/cancel).
 # 4) Apply idempotent changes with backups and logging.
+#
+# Maintenance note:
+# Keep shared wizard/apply behavior mirrored with system_hardening.sh unless
+# Alpine packaging, init, service, or VM/LXC constraints require a divergence.
 
 # -------- Runtime State --------
 DISTRO=""
