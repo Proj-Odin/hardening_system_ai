@@ -433,44 +433,55 @@ prompt_input() {
 }
 
 prompt_secret_confirm() {
-    local prompt="$1"
-    local confirm_prompt="$2"
+    local out_var="$1"
+    local prompt="$2"
+    local confirm_prompt="$3"
     local value1=""
     local value2=""
 
     while true; do
-        read -r -s -p "${prompt}: " value1
-        echo
+        if ! read -r -s -p "${prompt}: " value1; then
+            echo >&2
+            die "Input aborted while reading a secret value."
+        fi
+        echo >&2
         if [[ -z "${value1}" ]]; then
-            echo "Value cannot be blank."
+            echo "Value cannot be blank." >&2
             continue
         fi
 
-        read -r -s -p "${confirm_prompt}: " value2
-        echo
+        if ! read -r -s -p "${confirm_prompt}: " value2; then
+            echo >&2
+            die "Input aborted while confirming a secret value."
+        fi
+        echo >&2
         if [[ "${value1}" == "${value2}" ]]; then
-            echo "${value1}"
+            printf -v "${out_var}" '%s' "${value1}"
             return 0
         fi
 
-        echo "Entries did not match. Try again."
+        echo "Entries did not match. Try again." >&2
     done
 }
 
 prompt_ssh_public_keys() {
-    local username="$1"
+    local out_var="$1"
+    local username="$2"
     local line=""
     local keys=""
 
-    echo "Paste SSH public key(s) for ${username}, one per line. Finish with a blank line."
+    echo "Paste SSH public key(s) for ${username}, one per line. Finish with a blank line." >&2
     while true; do
-        read -r -p "> " line
+        if ! read -r -p "> " line; then
+            echo >&2
+            die "Input aborted while reading SSH public key(s) for ${username}."
+        fi
         line="${line%$'\r'}"
         if [[ -z "$(trim_spaces "${line}")" ]]; then
             if [[ -n "${keys}" ]]; then
                 break
             fi
-            echo "At least one SSH public key is required."
+            echo "At least one SSH public key is required." >&2
             continue
         fi
 
@@ -481,7 +492,7 @@ prompt_ssh_public_keys() {
         fi
     done
 
-    echo "${keys}"
+    printf -v "${out_var}" '%s' "${keys}"
 }
 
 prompt_menu() {
@@ -760,9 +771,9 @@ configure_access_accounts_prompt() {
         add_warning "Existing user ${ADMIN_USER} will be reused. Its password, shell, and sudo policy will be updated."
     fi
 
-    OPS_PASSWORD="$(prompt_secret_confirm "Password for ${OPS_USER}" "Confirm password for ${OPS_USER}")"
-    ADMIN_PASSWORD="$(prompt_secret_confirm "Password for ${ADMIN_USER}" "Confirm password for ${ADMIN_USER}")"
-    OPS_AUTHORIZED_KEYS="$(prompt_ssh_public_keys "${OPS_USER}")"
+    prompt_secret_confirm OPS_PASSWORD "Password for ${OPS_USER}" "Confirm password for ${OPS_USER}"
+    prompt_secret_confirm ADMIN_PASSWORD "Password for ${ADMIN_USER}" "Confirm password for ${ADMIN_USER}"
+    prompt_ssh_public_keys OPS_AUTHORIZED_KEYS "${OPS_USER}"
 
     add_warning "SSH login will be restricted to ${OPS_USER}. Test its SSH key in a second session before disconnecting."
     add_warning "Direct SSH for ${ADMIN_USER} will be denied. Use 'su - ${ADMIN_USER}' after logging in as ${OPS_USER}."
