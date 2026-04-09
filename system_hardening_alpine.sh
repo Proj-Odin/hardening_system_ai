@@ -49,6 +49,13 @@ SSH_PORT="22"
 DISABLE_ROOT_SSH=1
 DISABLE_PASSWORD_SSH=0
 SSH_RATE_LIMIT=1
+MANAGE_ACCESS_ACCOUNTS=0
+OPS_USER="ops"
+ADMIN_USER="admin"
+OPS_PASSWORD=""
+ADMIN_PASSWORD=""
+OPS_AUTHORIZED_KEYS=""
+SSH_ALLOW_ONLY_OPS=0
 
 MANAGE_UFW=1
 RESET_UFW=0
@@ -363,6 +370,11 @@ valid_cidr() {
     [[ "${value}" =~ ^[0-9a-fA-F:.]+/[0-9]{1,3}$ ]]
 }
 
+valid_unix_username() {
+    local value="$1"
+    [[ "${value}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
 validate_explicit_cidr_csv() {
     local csv="$1"
     local token
@@ -416,6 +428,58 @@ prompt_input() {
     echo "${answer:-${default}}"
 }
 
+prompt_secret_confirm() {
+    local prompt="$1"
+    local confirm_prompt="$2"
+    local value1=""
+    local value2=""
+
+    while true; do
+        read -r -s -p "${prompt}: " value1
+        echo
+        if [[ -z "${value1}" ]]; then
+            echo "Value cannot be blank."
+            continue
+        fi
+
+        read -r -s -p "${confirm_prompt}: " value2
+        echo
+        if [[ "${value1}" == "${value2}" ]]; then
+            echo "${value1}"
+            return 0
+        fi
+
+        echo "Entries did not match. Try again."
+    done
+}
+
+prompt_ssh_public_keys() {
+    local username="$1"
+    local line=""
+    local keys=""
+
+    echo "Paste SSH public key(s) for ${username}, one per line. Finish with a blank line."
+    while true; do
+        read -r -p "> " line
+        line="${line%$'\r'}"
+        if [[ -z "$(trim_spaces "${line}")" ]]; then
+            if [[ -n "${keys}" ]]; then
+                break
+            fi
+            echo "At least one SSH public key is required."
+            continue
+        fi
+
+        if [[ -z "${keys}" ]]; then
+            keys="${line}"
+        else
+            keys+=$'\n'"${line}"
+        fi
+    done
+
+    echo "${keys}"
+}
+
 prompt_menu() {
     # Returns the numeric choice as stdout for easy command-substitution use.
     local title="$1"
@@ -446,6 +510,10 @@ ssh_keys_appear_configured() {
     # Safety check: we only suggest disabling password auth when keys appear present.
     local users=("root")
     local user home
+
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 && -n "${OPS_AUTHORIZED_KEYS}" ]]; then
+        return 0
+    fi
 
     if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
         users+=("${SUDO_USER}")
@@ -636,6 +704,68 @@ select_profile() {
 choose_profile() {
     # Module alias kept for a clear top-level orchestration flow.
     select_profile
+}
+
+configure_access_accounts_prompt() {
+    echo
+    echo "=== Access Accounts ==="
+
+    MANAGE_ACCESS_ACCOUNTS=0
+    OPS_USER="ops"
+    ADMIN_USER="admin"
+    OPS_PASSWORD=""
+    ADMIN_PASSWORD=""
+    OPS_AUTHORIZED_KEYS=""
+    SSH_ALLOW_ONLY_OPS=0
+
+    if ! prompt_yes_no "Create dedicated ops/admin access accounts in this run?" "n"; then
+        return
+    fi
+
+    MANAGE_ACCESS_ACCOUNTS=1
+    SSH_ALLOW_ONLY_OPS=1
+
+    while true; do
+        OPS_USER="$(trim_spaces "$(prompt_input "SSH entry username" "ops")")"
+        if [[ "${OPS_USER}" == "root" ]]; then
+            echo "Choose a non-root username."
+        elif valid_unix_username "${OPS_USER}"; then
+            break
+        else
+            echo "Invalid username. Use lowercase letters, digits, _ or -, starting with a letter or underscore."
+        fi
+    done
+
+    while true; do
+        ADMIN_USER="$(trim_spaces "$(prompt_input "Admin username" "admin")")"
+        if [[ "${ADMIN_USER}" == "root" ]]; then
+            echo "Choose a non-root username."
+        elif [[ "${ADMIN_USER}" == "${OPS_USER}" ]]; then
+            echo "Admin username must be different from the SSH entry username."
+        elif valid_unix_username "${ADMIN_USER}"; then
+            break
+        else
+            echo "Invalid username. Use lowercase letters, digits, _ or -, starting with a letter or underscore."
+        fi
+    done
+
+    if id -u "${OPS_USER}" >/dev/null 2>&1; then
+        add_warning "Existing user ${OPS_USER} will be reused. Review its current groups and privileges before apply."
+    fi
+    if id -u "${ADMIN_USER}" >/dev/null 2>&1; then
+        add_warning "Existing user ${ADMIN_USER} will be reused. Its password, shell, and sudo policy will be updated."
+    fi
+
+    OPS_PASSWORD="$(prompt_secret_confirm "Password for ${OPS_USER}" "Confirm password for ${OPS_USER}")"
+    ADMIN_PASSWORD="$(prompt_secret_confirm "Password for ${ADMIN_USER}" "Confirm password for ${ADMIN_USER}")"
+    OPS_AUTHORIZED_KEYS="$(prompt_ssh_public_keys "${OPS_USER}")"
+
+    add_warning "SSH login will be restricted to ${OPS_USER}. Test its SSH key in a second session before disconnecting."
+    add_warning "Direct SSH for ${ADMIN_USER} will be denied. Use 'su - ${ADMIN_USER}' after logging in as ${OPS_USER}."
+}
+
+configure_access_accounts() {
+    configure_access_accounts_prompt
 }
 
 configure_ssh_prompt() {
@@ -1367,6 +1497,11 @@ evaluate_remote_access_risk() {
     if [[ "${PROFILE}" == "tailscale-gateway" && "${TAILSCALE_ENABLE_SSH}" -eq 1 && "${TAILSCALE_RUN_UP_NOW}" -ne 1 ]]; then
         add_remote_warning "Tailscale SSH is enabled but tailscale up is not automatic in this run."
     fi
+
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]]; then
+        add_remote_warning "SSH login will be restricted to ${OPS_USER}. Test that account before ending your current session."
+        add_remote_warning "Direct SSH for ${ADMIN_USER} will be denied. Use 'su - ${ADMIN_USER}' after logging in as ${OPS_USER}."
+    fi
 }
 
 add_planned_file() {
@@ -1400,6 +1535,11 @@ build_change_plan_preview() {
     add_planned_file "/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
     add_planned_file "/etc/ssh/sshd_config (include drop-in, if needed)"
     add_planned_service "${SSH_SERVICE} (reload/restart)"
+
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]]; then
+        add_planned_file "/home/${OPS_USER}/.ssh/authorized_keys"
+        add_planned_file "/etc/sudoers.d/90-homelab-${ADMIN_USER}"
+    fi
 
     if [[ "${MANAGE_UFW}" -eq 1 ]]; then
         add_planned_file "/etc/ufw/user.rules"
@@ -1493,6 +1633,17 @@ show_summary() {
     echo "  Disable root login:    $([[ "${DISABLE_ROOT_SSH}" -eq 1 ]] && echo "yes" || echo "no")"
     echo "  Disable password auth: $([[ "${DISABLE_PASSWORD_SSH}" -eq 1 ]] && echo "yes" || echo "no")"
     echo "  Rate limiting:         $([[ "${SSH_RATE_LIMIT}" -eq 1 ]] && echo "yes" || echo "no")"
+    echo
+    echo "Access accounts:"
+    echo "  Managed users:         $([[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]] && echo "yes" || echo "no")"
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]]; then
+        echo "  SSH entry user:        ${OPS_USER}"
+        echo "  Admin user:            ${ADMIN_USER}"
+        echo "  Ops SSH keys staged:   yes"
+        echo "  Passwords staged:      yes"
+        echo "  SSH restricted to ops: $([[ "${SSH_ALLOW_ONLY_OPS}" -eq 1 ]] && echo "yes" || echo "no")"
+        echo "  Admin direct SSH:      denied"
+    fi
     echo
     echo "Firewall (UFW):"
     echo "  Manage UFW:            $([[ "${MANAGE_UFW}" -eq 1 ]] && echo "yes" || echo "no")"
@@ -1740,6 +1891,11 @@ prepare_package_queue() {
     queue_package "curl"
     queue_package "wget"
 
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]]; then
+        queue_package "sudo"
+        queue_package "shadow"
+    fi
+
     if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
         queue_package "openssh-server-common-openrc"
         queue_package "ufw-openrc"
@@ -1822,6 +1978,100 @@ install_tailscale_package() {
     fi
 }
 
+default_login_shell() {
+    if [[ -x /bin/bash ]]; then
+        echo "/bin/bash"
+    else
+        echo "/bin/sh"
+    fi
+}
+
+get_user_home() {
+    getent passwd "$1" | cut -d: -f6
+}
+
+ensure_local_user_present() {
+    local username="$1"
+    local login_shell="$2"
+
+    if id -u "${username}" >/dev/null 2>&1; then
+        log "User exists: ${username}"
+        usermod -s "${login_shell}" "${username}"
+    else
+        useradd -m -s "${login_shell}" "${username}"
+        log "Created user: ${username}"
+    fi
+}
+
+ssh_allowusers_conflict_exists() {
+    local managed_dropin="$1"
+    local cfg=""
+    local -a files=()
+
+    shopt -s nullglob
+    files=(/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf)
+    shopt -u nullglob
+
+    for cfg in "${files[@]}"; do
+        [[ "${cfg}" == "${managed_dropin}" ]] && continue
+        if [[ -f "${cfg}" ]] && grep -Eq '^[[:space:]]*AllowUsers[[:space:]]+' "${cfg}"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+apply_access_accounts() {
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -ne 1 ]]; then
+        return
+    fi
+
+    log "Configuring dedicated access accounts"
+
+    if ! command -v useradd >/dev/null 2>&1 || ! command -v usermod >/dev/null 2>&1 || ! command -v chpasswd >/dev/null 2>&1; then
+        die "Required user-management tools are missing. Install the necessary account packages first."
+    fi
+    if ! command -v visudo >/dev/null 2>&1; then
+        die "visudo is required to validate sudo access for ${ADMIN_USER}."
+    fi
+
+    local login_shell
+    local ops_home
+    local ops_group
+    local sudoers_file="/etc/sudoers.d/90-homelab-${ADMIN_USER}"
+
+    login_shell="$(default_login_shell)"
+    ensure_local_user_present "${OPS_USER}" "${login_shell}"
+    ensure_local_user_present "${ADMIN_USER}" "${login_shell}"
+
+    printf '%s:%s\n' "${OPS_USER}" "${OPS_PASSWORD}" | chpasswd
+    printf '%s:%s\n' "${ADMIN_USER}" "${ADMIN_PASSWORD}" | chpasswd
+    log "Updated passwords for ${OPS_USER} and ${ADMIN_USER}"
+
+    ops_home="$(get_user_home "${OPS_USER}")"
+    [[ -n "${ops_home}" ]] || die "Unable to determine home directory for ${OPS_USER}."
+    ops_group="$(id -gn "${OPS_USER}")"
+
+    install -d -m 0700 -o "${OPS_USER}" -g "${ops_group}" "${ops_home}/.ssh"
+    backup_config "${ops_home}/.ssh/authorized_keys"
+    printf '%s\n' "${OPS_AUTHORIZED_KEYS}" > "${ops_home}/.ssh/authorized_keys"
+    chown "${OPS_USER}:${ops_group}" "${ops_home}/.ssh/authorized_keys"
+    chmod 0600 "${ops_home}/.ssh/authorized_keys"
+    log "Installed SSH public key(s) for ${OPS_USER}"
+
+    mkdir -p /etc/sudoers.d
+    write_file_with_backup "${sudoers_file}" <<EOF
+# Managed by homelab hardening script (${SCRIPT_VERSION})
+${ADMIN_USER} ALL=(ALL:ALL) ALL
+EOF
+    chmod 0440 "${sudoers_file}"
+    if ! visudo -cf "${sudoers_file}" >/dev/null 2>&1; then
+        die "Generated sudoers entry for ${ADMIN_USER} failed validation."
+    fi
+    log "Granted sudo access to ${ADMIN_USER}"
+}
+
 ensure_sshd_include_dropin() {
     local main_cfg="/etc/ssh/sshd_config"
     local include_line="Include /etc/ssh/sshd_config.d/*.conf"
@@ -1846,6 +2096,11 @@ apply_ssh_hardening() {
     local ssh_dropin="/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
     ensure_sshd_include_dropin
 
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 && "${SSH_ALLOW_ONLY_OPS}" -eq 1 ]] && \
+       ssh_allowusers_conflict_exists "${ssh_dropin}"; then
+        die "Existing AllowUsers directives were found outside the managed drop-in. Review them before enforcing ops-only SSH access."
+    fi
+
     write_file_with_backup "${ssh_dropin}" <<EOF
 # Managed by homelab hardening script (${SCRIPT_VERSION})
 Port ${SSH_PORT}
@@ -1854,6 +2109,8 @@ PasswordAuthentication $([[ "${DISABLE_PASSWORD_SSH}" -eq 1 ]] && echo "no" || e
 PermitEmptyPasswords no
 ChallengeResponseAuthentication no
 PubkeyAuthentication yes
+$([[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 && "${SSH_ALLOW_ONLY_OPS}" -eq 1 ]] && echo "AllowUsers ${OPS_USER}" || echo "# AllowUsers unchanged by policy")
+$([[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]] && echo "DenyUsers ${ADMIN_USER}" || echo "# DenyUsers unchanged by policy")
 X11Forwarding no
 ClientAliveInterval 300
 ClientAliveCountMax 2
@@ -2298,6 +2555,7 @@ apply_all_changes() {
     run_cmd apk update
     install_queued_packages
 
+    apply_access_accounts
     apply_ssh_hardening
     apply_ufw
     apply_fail2ban
@@ -2316,6 +2574,7 @@ apply_changes() {
 
 print_post_apply() {
     local service_hint
+    local next_step="4"
     service_hint="$(post_apply_services_hint)"
 
     echo
@@ -2331,8 +2590,12 @@ print_post_apply() {
     echo "1) Verify SSH login in a second session before closing this one."
     echo "2) Run: ufw status verbose"
     echo "3) Run: ${service_hint}"
+    if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 ]]; then
+        echo "${next_step}) Test ${OPS_USER} SSH access, then run: su - ${ADMIN_USER}"
+        next_step="5"
+    fi
     if [[ "${INSTALL_CHECKMK}" -eq 1 && "${CHECKMK_COMM_MODE}" == "tls" ]]; then
-        echo "4) Complete Checkmk TLS registration (cmk-agent-ctl register)."
+        echo "${next_step}) Complete Checkmk TLS registration (cmk-agent-ctl register)."
     fi
     echo "======================================================"
 }
@@ -2354,6 +2617,7 @@ run_interactive_wizard() {
     reset_wizard_review_state
     choose_deployment_target
     choose_profile
+    configure_access_accounts
     configure_ssh
     configure_firewall
     configure_profile_prompt
