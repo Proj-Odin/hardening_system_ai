@@ -34,6 +34,7 @@ declare -a CUSTOM_PACKAGES=()
 declare -a REMOTE_ACCESS_WARNINGS=()
 declare -a PLANNED_FILES=()
 declare -a PLANNED_SERVICES=()
+declare -A SSHD_CONFIG_PARSE_SEEN=()
 
 # REMOTE_ACCESS_RISK is a single summary flag used to print a final
 # "you could lose access" warning when high-risk SSH/firewall choices exist.
@@ -174,6 +175,229 @@ setup_runtime_paths() {
     log "Backup directory: ${BACKUP_DIR}"
 }
 
+resolve_sshd_binary() {
+    local candidate=""
+
+    if candidate="$(command -v sshd 2>/dev/null)"; then
+        if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    fi
+
+    for candidate in /usr/sbin/sshd /sbin/sshd; do
+        if [[ -x "${candidate}" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+extract_first_port_from_text() {
+    local content="$1"
+    local line=""
+    local directive=""
+    local value=""
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%%#*}"
+        line="$(trim_spaces "${line}")"
+        [[ -n "${line}" ]] || continue
+
+        read -r directive value <<< "${line}"
+        directive="${directive,,}"
+
+        if [[ "${directive}" == "port" ]] && valid_port "${value}"; then
+            echo "${value}"
+            return 0
+        fi
+    done <<< "${content}"
+
+    return 1
+}
+
+detect_ssh_port_from_sshd_test() {
+    local sshd_bin="$1"
+    local sshd_output=""
+    local port=""
+
+    # sshd -T is the best source of effective settings, but it can fail during
+    # partial installs, with invalid configs, or when runtime prerequisites are
+    # missing. Treat that as an informational fallback, not a startup failure.
+    if sshd_output="$("${sshd_bin}" -T 2>/dev/null)"; then
+        if port="$(extract_first_port_from_text "${sshd_output}")"; then
+            echo "${port}"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+parse_sshd_port_from_glob() {
+    local pattern="$1"
+    local include_file=""
+    local port=""
+
+    while IFS= read -r include_file; do
+        if port="$(parse_sshd_port_from_file "${include_file}")"; then
+            echo "${port}"
+            return 0
+        fi
+    done < <(compgen -G "${pattern}" || true)
+
+    return 1
+}
+
+parse_sshd_port_from_file() {
+    local file="$1"
+    local line=""
+    local directive=""
+    local value=""
+    local pattern=""
+    local port=""
+    local in_match=0
+    local -a include_patterns=()
+
+    [[ -f "${file}" ]] || return 1
+    if [[ -n "${SSHD_CONFIG_PARSE_SEEN[${file}]:-}" ]]; then
+        return 1
+    fi
+    SSHD_CONFIG_PARSE_SEEN["${file}"]=1
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%%#*}"
+        line="$(trim_spaces "${line}")"
+        [[ -n "${line}" ]] || continue
+
+        read -r directive value <<< "${line}"
+        directive="${directive,,}"
+
+        if [[ "${directive}" == "match" ]]; then
+            in_match=1
+        fi
+        if [[ "${in_match}" -eq 1 ]]; then
+            continue
+        fi
+
+        if [[ "${directive}" == "include" ]]; then
+            read -r -a include_patterns <<< "${value}"
+            for pattern in "${include_patterns[@]}"; do
+                pattern="${pattern#\"}"
+                pattern="${pattern%\"}"
+                pattern="${pattern#\'}"
+                pattern="${pattern%\'}"
+                if port="$(parse_sshd_port_from_glob "${pattern}")"; then
+                    echo "${port}"
+                    return 0
+                fi
+            done
+            continue
+        fi
+
+        # Conservative fallback: honor the first global Port before Match blocks,
+        # which mirrors sshd_config's "first obtained value wins" behavior.
+        if [[ "${directive}" == "port" ]] && valid_port "${value}"; then
+            echo "${value}"
+            return 0
+        fi
+    done < "${file}"
+
+    return 1
+}
+
+detect_ssh_port_from_config() {
+    local port=""
+    local config_file=""
+
+    SSHD_CONFIG_PARSE_SEEN=()
+    if port="$(parse_sshd_port_from_file "/etc/ssh/sshd_config")"; then
+        echo "${port}"
+        return 0
+    fi
+
+    while IFS= read -r config_file; do
+        if port="$(parse_sshd_port_from_file "${config_file}")"; then
+            echo "${port}"
+            return 0
+        fi
+    done < <(compgen -G "/etc/ssh/sshd_config.d/*.conf" || true)
+
+    return 1
+}
+
+detect_ssh_port_from_sockets() {
+    local socket_output=""
+    local line=""
+    local local_addr=""
+    local port=""
+
+    if ! command -v ss >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! socket_output="$(ss -tlnp 2>/dev/null)"; then
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ "${line}" == *"sshd"* ]] || continue
+        read -r _ _ _ local_addr _ _ <<< "${line}"
+        port="${local_addr##*:}"
+        port="${port//[\[\]]/}"
+        if valid_port "${port}"; then
+            echo "${port}"
+            return 0
+        fi
+    done <<< "${socket_output}"
+
+    return 1
+}
+
+sshd_config_is_valid() {
+    local sshd_bin=""
+
+    if ! sshd_bin="$(resolve_sshd_binary)"; then
+        return 1
+    fi
+
+    if "${sshd_bin}" -t; then
+        return 0
+    fi
+
+    return 1
+}
+
+detect_ssh_port() {
+    local sshd_bin=""
+    local port=""
+
+    if sshd_bin="$(resolve_sshd_binary)"; then
+        if port="$(detect_ssh_port_from_sshd_test "${sshd_bin}")"; then
+            echo "${port}"
+            return 0
+        fi
+        log "Unable to auto-detect sshd port from sshd -T, falling back to config parse"
+    else
+        log "sshd binary not found in PATH, /usr/sbin, or /sbin; falling back to config parse"
+    fi
+
+    if port="$(detect_ssh_port_from_config)"; then
+        echo "${port}"
+        return 0
+    fi
+
+    log "Unable to auto-detect sshd port from config files, falling back to listening sockets"
+    if port="$(detect_ssh_port_from_sockets)"; then
+        echo "${port}"
+        return 0
+    fi
+
+    log "Unable to determine SSH port, defaulting to 22"
+    echo "22"
+}
+
 detect_environment() {
     # /etc/os-release is the canonical source for distro detection.
     if [[ -f /etc/os-release ]]; then
@@ -200,11 +424,7 @@ detect_environment() {
         SSH_SERVICE="ssh"
     fi
 
-    # Read sshd's effective config so we detect non-default ports safely.
-    if command -v sshd >/dev/null 2>&1; then
-        CURRENT_SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')"
-    fi
-    CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
+    CURRENT_SSH_PORT="$(detect_ssh_port)"
     SSH_PORT="${CURRENT_SSH_PORT}"
 
     if [[ "${DISTRO}" == "debian-like" ]]; then
@@ -1938,7 +2158,7 @@ ClientAliveCountMax 2
 $([[ "${SSH_RATE_LIMIT}" -eq 1 ]] && echo "MaxStartups 3:30:10" || echo "# MaxStartups unchanged by policy")
 EOF
 
-    if ! sshd -t; then
+    if ! sshd_config_is_valid; then
         die "sshd configuration validation failed. SSH config was not applied safely."
     fi
 
@@ -2146,7 +2366,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 EOF
 
-        if sshd -t; then
+        if sshd_config_is_valid; then
             systemctl reload "${SSH_SERVICE}" || systemctl restart "${SSH_SERVICE}"
         else
             warn "Strong admin SSH controls failed validation; keeping prior SSH runtime config."
@@ -2155,7 +2375,7 @@ EOF
         if [[ -f "${strict_file}" ]]; then
             backup_config "${strict_file}"
             rm -f "${strict_file}"
-            if sshd -t; then
+            if sshd_config_is_valid; then
                 systemctl reload "${SSH_SERVICE}" || systemctl restart "${SSH_SERVICE}"
             fi
         fi
