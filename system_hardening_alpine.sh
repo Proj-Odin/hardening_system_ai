@@ -990,6 +990,8 @@ configure_access_accounts_prompt() {
     if id -u "${ADMIN_USER}" >/dev/null 2>&1; then
         add_warning "Existing user ${ADMIN_USER} will be reused. Its password, shell, and sudo policy will be updated."
     fi
+    note_existing_group_reuse_for_requested_user "${OPS_USER}"
+    note_existing_group_reuse_for_requested_user "${ADMIN_USER}"
 
     prompt_secret_confirm OPS_PASSWORD "Password for ${OPS_USER}" "Confirm password for ${OPS_USER}"
     prompt_secret_confirm ADMIN_PASSWORD "Password for ${ADMIN_USER}" "Confirm password for ${ADMIN_USER}"
@@ -2225,17 +2227,65 @@ get_user_home() {
     getent passwd "$1" | cut -d: -f6
 }
 
+requested_username_matches_existing_group() {
+    local username="$1"
+
+    if id -u "${username}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    getent group "${username}" >/dev/null 2>&1
+}
+
+note_existing_group_reuse_for_requested_user() {
+    local username="$1"
+
+    if requested_username_matches_existing_group "${username}"; then
+        echo "Note: group ${username} already exists; the user will reuse it as the primary group."
+        add_warning "Requested username ${username} matches an existing group. The account will reuse primary group ${username} if created."
+    fi
+}
+
+create_local_user_with_group_fallback() {
+    local username="$1"
+    local login_shell="$2"
+
+    # Debian-family systems can have legacy groups such as "admin" pre-created.
+    # Make the primary group explicit in that case so useradd does not fail while
+    # trying to create a same-named group implicitly.
+    if getent group "${username}" >/dev/null 2>&1; then
+        log "User ${username} requested, but group ${username} already exists; reusing existing group as primary group"
+        if useradd -m -s "${login_shell}" -g "${username}" "${username}"; then
+            log "Created user ${username} with existing primary group ${username}"
+            return 0
+        fi
+
+        log "Failed to create user ${username} while reusing existing primary group ${username}"
+        die "Unable to create local user ${username} with existing primary group ${username}. Review 'getent passwd ${username}' and 'getent group ${username}', then rerun the script."
+    fi
+
+    if useradd -m -s "${login_shell}" "${username}"; then
+        log "Created user: ${username}"
+        return 0
+    fi
+
+    log "Failed to create user ${username} while creating a same-name primary group"
+    die "Unable to create local user ${username}. Review 'getent passwd ${username}' and 'getent group ${username}', then rerun the script."
+}
+
 ensure_local_user_present() {
     local username="$1"
     local login_shell="$2"
 
     if id -u "${username}" >/dev/null 2>&1; then
         log "User exists: ${username}"
-        usermod -s "${login_shell}" "${username}"
-    else
-        useradd -m -s "${login_shell}" "${username}"
-        log "Created user: ${username}"
+        if ! usermod -s "${login_shell}" "${username}"; then
+            die "Unable to update login shell for existing user ${username}."
+        fi
+        return 0
     fi
+
+    create_local_user_with_group_fallback "${username}" "${login_shell}"
 }
 
 ssh_allowusers_conflict_exists() {

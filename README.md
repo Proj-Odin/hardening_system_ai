@@ -43,6 +43,7 @@ Alpine-specific notes:
 - Checkmk integration keeps the same communication/firewall flow, but Alpine installation is manual by default or via a custom `.apk` URL
 - Shared wizard/apply behavior should stay mirrored with `system_hardening.sh` unless Alpine package, init, service, or VM/LXC constraints require a distro-specific branch
 - Run `python verify_hardening_sync.py` after shared hardening changes to catch accidental drift
+- Run `bash test_access_account_creation.sh` after touching dedicated access-account creation logic
 
 ## Interactive Menu Flow
 
