@@ -113,6 +113,13 @@ For Alpine:
 - Managed config writes are backup-first
 - Safe to rerun for iterative hardening/tuning
 
+## Validation
+
+- Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
+- Run `bash test_ssh_port_detection.sh` after touching SSH detection or validation logic.
+- Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.
+- Track real cloud test work in `TODO_CLOUD_E2E.md`. Generated cloud or mock run artifacts should stay local and uncommitted.
+
 ## Other Scripts
 
 ### `checkmk_setup.sh`
