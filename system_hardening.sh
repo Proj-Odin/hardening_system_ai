@@ -2070,102 +2070,14 @@ note_existing_group_reuse_for_requested_user() {
     fi
 }
 
-log_account_command_result() {
-    local label="$1"
-    shift
-    local output=""
-    local status=0
-    local line=""
-
-    if output="$("$@" 2>&1)"; then
-        if [[ -n "${output}" ]]; then
-            while IFS= read -r line; do
-                log "${label}: ${line}"
-            done <<< "${output}"
-        else
-            log "${label}: found"
-        fi
-        return 0
-    fi
-
-    status=$?
-    if [[ -n "${output}" ]]; then
-        while IFS= read -r line; do
-            log "${label}: ${line}"
-        done <<< "${output}"
-    else
-        log "${label}: not found (exit ${status})"
-    fi
-}
-
-log_useradd_failure_diagnostics() {
-    local username="$1"
-
-    log "Diagnostics for failed useradd ${username}:"
-    log_account_command_result "getent passwd ${username}" getent passwd "${username}"
-    log_account_command_result "getent group ${username}" getent group "${username}"
-    if command -v id >/dev/null 2>&1; then
-        log_account_command_result "id ${username}" id "${username}"
-    else
-        log "id ${username}: id command unavailable"
-    fi
-}
-
-update_existing_user_shell() {
-    local username="$1"
-    local login_shell="$2"
-    local output=""
-    local output_file=""
-    local line=""
-
-    output_file="$(mktemp "${TMPDIR:-/tmp}/homelab-usermod.XXXXXX")" || die "Unable to create temporary file for usermod output."
-
-    if usermod -s "${login_shell}" "${username}" >"${output_file}" 2>&1; then
-        output="$(cat "${output_file}")"
-        rm -f "${output_file}"
-        if [[ -n "${output}" ]]; then
-            while IFS= read -r line; do
-                log "usermod ${username}: ${line}"
-            done <<< "${output}"
-        fi
-        return 0
-    fi
-
-    output="$(cat "${output_file}")"
-    rm -f "${output_file}"
-
-    if [[ "${output}" == *"no changes"* ]]; then
-        log "Login shell already correct for ${username}; usermod reported no changes"
-        return 0
-    fi
-
-    if [[ -n "${output}" ]]; then
-        while IFS= read -r line; do
-            log "usermod ${username}: ${line}"
-        done <<< "${output}"
-    fi
-    die "Unable to update login shell for existing user ${username}."
-}
-
 create_local_user_with_group_fallback() {
     local username="$1"
     local login_shell="$2"
-    local passwd_state="not found"
-    local group_state="not found"
-
-    if getent passwd "${username}" >/dev/null 2>&1; then
-        passwd_state="found"
-    fi
-    if getent group "${username}" >/dev/null 2>&1; then
-        group_state="found"
-    fi
-
-    log "Pre-create account lookup for ${username}: passwd=${passwd_state}, group=${group_state}"
 
     # Debian-family systems can have legacy groups such as "admin" pre-created.
     # Make the primary group explicit in that case so useradd does not fail while
     # trying to create a same-named group implicitly.
-    if [[ "${group_state}" == "found" ]]; then
+    if getent group "${username}" >/dev/null 2>&1; then
         log "User ${username} requested, but group ${username} already exists; reusing existing group as primary group"
         if useradd -m -s "${login_shell}" -g "${username}" "${username}"; then
             log "Created user ${username} with existing primary group ${username}"
@@ -2173,7 +2085,6 @@ create_local_user_with_group_fallback() {
         fi
 
         log "Failed to create user ${username} while reusing existing primary group ${username}"
-        log_useradd_failure_diagnostics "${username}"
         die "Unable to create local user ${username} with existing primary group ${username}. Review 'getent passwd ${username}' and 'getent group ${username}', then rerun the script."
     fi
 
@@ -2183,7 +2094,6 @@ create_local_user_with_group_fallback() {
     fi
 
     log "Failed to create user ${username} while creating a same-name primary group"
-    log_useradd_failure_diagnostics "${username}"
     die "Unable to create local user ${username}. Review 'getent passwd ${username}' and 'getent group ${username}', then rerun the script."
 }
 
@@ -2193,7 +2103,9 @@ ensure_local_user_present() {
 
     if id -u "${username}" >/dev/null 2>&1; then
         log "User exists: ${username}"
-        update_existing_user_shell "${username}" "${login_shell}"
+        if ! usermod -s "${login_shell}" "${username}"; then
+            die "Unable to update login shell for existing user ${username}."
+        fi
         return 0
     fi
 
