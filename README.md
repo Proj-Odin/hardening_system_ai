@@ -105,6 +105,7 @@ For Alpine:
 - Optional Fail2Ban (recommended)
 - Optional automatic patching (interactive)
 - Optional AppArmor (interactive)
+- Optional IPv6 disable via a managed sysctl drop-in (`/etc/sysctl.d/99-disable-ipv6.conf`), default off and reversible by removing the drop-in. It can be preselected with `DISABLE_IPV6=true` or `HARDEN_DISABLE_IPV6=true`.
 - Summary + final confirmation required before apply
 
 ## Logs, Backups, and Reruns
@@ -118,6 +119,7 @@ For Alpine:
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
 - Run `bash test_ssh_port_detection.sh` after touching SSH detection or validation logic.
+- Run `bash test_ipv6_disable.sh` after touching IPv6 sysctl hardening logic.
 - Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.
 - Track real cloud test work in `TODO_CLOUD_E2E.md`. Generated cloud or mock run artifacts should stay local and uncommitted.
 

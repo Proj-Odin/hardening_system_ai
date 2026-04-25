@@ -54,6 +54,7 @@ SSH_PORT="22"
 DISABLE_ROOT_SSH=1
 DISABLE_PASSWORD_SSH=0
 SSH_RATE_LIMIT=1
+DISABLE_IPV6="${HARDEN_DISABLE_IPV6:-${DISABLE_IPV6:-false}}"
 MANAGE_ACCESS_ACCOUNTS=0
 OPS_USER="ops"
 ADMIN_USER="admin"
@@ -558,6 +559,103 @@ add_warning() {
 add_remote_warning() {
     REMOTE_ACCESS_RISK=1
     REMOTE_ACCESS_WARNINGS+=("$*")
+}
+
+flag_enabled() {
+    case "${1:-}" in
+        1|true|TRUE|True|yes|YES|Yes|y|Y|on|ON|On) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ipv6_sysctl_keys() {
+    printf '%s\n' \
+        "net.ipv6.conf.all.disable_ipv6" \
+        "net.ipv6.conf.default.disable_ipv6" \
+        "net.ipv6.conf.lo.disable_ipv6"
+}
+
+ipv6_disable_settings_active() {
+    local key
+    local value
+
+    while IFS= read -r key; do
+        if ! value="$(sysctl -n "${key}" 2>/dev/null)"; then
+            return 1
+        fi
+        if [[ "$(trim_spaces "${value}")" != "1" ]]; then
+            return 1
+        fi
+    done < <(ipv6_sysctl_keys)
+
+    return 0
+}
+
+write_ipv6_disable_sysctl_dropin() {
+    local sysctl_file="$1"
+
+    write_file_with_backup "${sysctl_file}" <<'EOF'
+# Managed by system_hardening.sh
+# Disable IPv6 system-wide
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+}
+
+apply_ipv6_sysctl_value() {
+    local key="$1"
+    local value="$2"
+    local output=""
+
+    if output="$(sysctl -w "${key}=${value}" 2>&1)"; then
+        log "${output}"
+        return 0
+    fi
+
+    warn "Could not set ${key}=${value}: ${output:-sysctl returned non-zero}"
+}
+
+log_ipv6_validation_output() {
+    local key
+    local output=""
+    local line=""
+
+    while IFS= read -r key; do
+        if output="$(sysctl "${key}" 2>&1)"; then
+            while IFS= read -r line; do
+                log "IPv6 validation: ${line}"
+            done <<< "${output}"
+        else
+            warn "Could not read ${key}: ${output:-sysctl returned non-zero}"
+        fi
+    done < <(ipv6_sysctl_keys)
+
+    if command -v ip >/dev/null 2>&1; then
+        if output="$(ip -6 addr show 2>&1)"; then
+            if [[ -z "${output}" ]]; then
+                log "IPv6 validation: ip -6 addr show returned no addresses"
+            else
+                while IFS= read -r line; do
+                    log "IPv6 validation: ${line}"
+                done <<< "${output}"
+            fi
+        else
+            warn "Could not run ip -6 addr show: ${output:-ip returned non-zero}"
+        fi
+    else
+        warn "Could not run ip -6 addr show: ip command unavailable"
+    fi
+}
+
+apply_sysctl_system_nonfatal() {
+    local context="$1"
+
+    if sysctl --system >/dev/null; then
+        log "Applied sysctl settings for ${context}."
+    else
+        warn "sysctl --system returned non-zero while applying ${context}. Review sysctl output and current kernel/container capabilities."
+    fi
 }
 
 queue_package() {
@@ -1516,6 +1614,20 @@ configure_apparmor() {
     fi
 }
 
+configure_ipv6_disable_prompt() {
+    local default_choice="n"
+
+    if flag_enabled "${DISABLE_IPV6}"; then
+        default_choice="y"
+    fi
+
+    if prompt_yes_no "Disable IPv6 system-wide?" "${default_choice}"; then
+        DISABLE_IPV6=true
+    else
+        DISABLE_IPV6=false
+    fi
+}
+
 configure_unattended_upgrades() {
     local update_choice
     update_choice="$(prompt_menu "APK Update Strategy" "1" \
@@ -1537,6 +1649,7 @@ configure_base_security() {
     configure_fail2ban
     configure_unattended_upgrades
     configure_apparmor
+    configure_ipv6_disable_prompt
 }
 
 configure_security_services_prompt() {
@@ -1794,6 +1907,11 @@ build_change_plan_preview() {
         add_planned_service "apparmor (enable/start if available)"
     fi
 
+    if flag_enabled "${DISABLE_IPV6}"; then
+        add_planned_file "/etc/sysctl.d/99-disable-ipv6.conf"
+        add_planned_service "sysctl (apply IPv6 disable settings)"
+    fi
+
     case "${UPDATE_MODE}" in
         notify)
             add_planned_file "/etc/periodic/daily/homelab-apk-notify"
@@ -1906,6 +2024,7 @@ show_summary() {
     echo "Security services:"
     echo "  Fail2Ban:              $([[ "${INSTALL_FAIL2BAN}" -eq 1 ]] && echo "install" || echo "skip")"
     echo "  AppArmor:              $([[ "${ENABLE_APPARMOR}" -eq 1 ]] && echo "enable" || echo "skip")"
+    echo "  Disable IPv6:          $(flag_enabled "${DISABLE_IPV6}" && echo "yes" || echo "no")"
     echo "  APK auto-upgrades:     $([[ "${UPDATE_MODE}" == "unattended" ]] && echo "enabled" || echo "disabled")"
     echo "  Update mode:           ${UPDATE_MODE}"
     echo
@@ -2524,6 +2643,35 @@ EOF
     esac
 }
 
+apply_ipv6_disable() {
+    local disable_ipv6="${1:-${DISABLE_IPV6:-false}}"
+    local sysctl_file="${2:-/etc/sysctl.d/99-disable-ipv6.conf}"
+    local key
+
+    if ! flag_enabled "${disable_ipv6}"; then
+        log "IPv6 disable option not selected; leaving IPv6 configuration unchanged."
+        return 0
+    fi
+
+    if ipv6_disable_settings_active; then
+        log "IPv6 is already disabled by active sysctl settings; refreshing managed drop-in."
+    else
+        log "Disabling IPv6 via managed sysctl drop-in: ${sysctl_file}"
+    fi
+
+    write_ipv6_disable_sysctl_dropin "${sysctl_file}"
+
+    while IFS= read -r key; do
+        apply_ipv6_sysctl_value "${key}" "1"
+    done < <(ipv6_sysctl_keys)
+
+    if [[ -f /etc/default/ufw ]] && grep -Eq '^[[:space:]]*IPV6="?yes"?' /etc/default/ufw; then
+        log "Leaving /etc/default/ufw IPV6 setting unchanged; IPv6 is disabled at the sysctl layer."
+    fi
+
+    log_ipv6_validation_output
+}
+
 apply_checkmk() {
     if [[ "${INSTALL_CHECKMK}" -ne 1 ]]; then
         return
@@ -2687,7 +2835,7 @@ apply_tailscale_gateway_profile() {
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-            sysctl --system >/dev/null
+            apply_sysctl_system_nonfatal "tailscale gateway forwarding"
         fi
     fi
 
@@ -2846,6 +2994,7 @@ apply_all_changes() {
     apply_fail2ban
     apply_apparmor
     apply_update_mode
+    apply_ipv6_disable
     apply_checkmk
     apply_profile_specific
 
