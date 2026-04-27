@@ -39,6 +39,18 @@ Convenience entry points:
 Alpine-specific notes:
 - The script asks for an Alpine target (`vm` or `lxc`) and changes defaults/warnings accordingly
 - LXC defaults are more conservative around UFW, Fail2Ban, AppArmor, Docker nesting, and kernel forwarding
+- Alpine LXC installs `tmux` as a standard helper tool for resilient terminal sessions during hardening and follow-up work
+- Alpine LXC ZeroClaw install is supported through an optional source build prompt. This creates a dedicated `zeroclaw` runtime user and installs ZeroClaw under `/home/zeroclaw`
+- Prebuilt `x86_64-unknown-linux-gnu` ZeroClaw binaries are GNU/glibc builds and are not suitable for Alpine/musl unless upstream provides a musl build. The Alpine path uses source build instead of `install.sh --prebuilt`
+- Recommended ZeroClaw runtime paths are `/home/zeroclaw/.zeroclaw` and `/home/zeroclaw/.cargo/bin/zeroclaw`
+- After hardening, finish ZeroClaw setup as the runtime user:
+
+  ```sh
+  su - zeroclaw
+  zeroclaw onboard
+  zeroclaw agent
+  ```
+
 - APK update automation uses `/etc/periodic/daily/` + `crond` instead of `unattended-upgrades`
 - Checkmk integration keeps the same communication/firewall flow, but Alpine installation is manual by default or via a custom `.apk` URL
 - Shared wizard/apply behavior should stay mirrored with `system_hardening.sh` unless Alpine package, init, service, or VM/LXC constraints require a distro-specific branch
