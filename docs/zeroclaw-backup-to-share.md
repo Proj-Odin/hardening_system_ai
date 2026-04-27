@@ -156,13 +156,53 @@ With `REQUIRE_MOUNT=1`, the script refuses to write unless `SHARE_MOUNT` appears
 
 Stop ZeroClaw before restoring.
 
-Verify the backup:
+Use the no-mount restore companion when restoring from TrueNAS SMB on Alpine/LXC:
+
+```sh
+AUTO_INSTALL_DEPS=1 \
+RESTORE_CONFIRM=1 \
+BACKUP_HOST=alpine-claw3 \
+BACKUP_TIMESTAMP=20260427_022240 \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/restore-zeroclaw-from-share.sh
+```
+
+Dry run the newest backup for the current host:
+
+```sh
+AUTO_INSTALL_DEPS=1 \
+DRY_RUN=1 \
+RESTORE_LATEST=1 \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/restore-zeroclaw-from-share.sh
+```
+
+The restore script supports both clean and duplicated remote roots, including:
+
+```text
+//172.16.172.27/zeroclaw-backups/zeroclaw-backups/zeroclaw/alpine-claw3/20260427_022240/
+```
+
+It verifies the downloaded backup before changing `APP_DIR`:
 
 ```sh
 sha256sum -c SHA256SUMS.txt
 ```
 
-Restore the full `.zeroclaw` directory by moving the current directory aside, then extracting `zeroclaw-full.tar.gz`.
+Restore behavior:
+
+- creates a local staging directory under `/tmp`
+- validates `SHA256SUMS.txt`
+- prints `manifest.txt`
+- creates a pre-restore backup of the current `.zeroclaw`
+- moves the existing `.zeroclaw` aside when `FORCE=0`
+- extracts `zeroclaw-full.tar.gz`
+- restores `configs/config.toml` explicitly when present
+- applies `sqlite/*.backup` files when the manifest has parseable original DB paths
 
 Restore SQLite from the `.backup` files under `sqlite/`. Use `.sql` as a readable fallback:
 

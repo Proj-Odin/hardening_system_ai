@@ -195,28 +195,98 @@ Hermes:
 
 ## Restore
 
-Stop the app before restoring files.
+`scripts/restore-app-from-share.sh` is the no-mount restore companion for `scripts/backup-app-to-share.sh`. It uses `smbclient` directly, so it works in Alpine/LXC environments where CIFS/NFS mounts fail.
 
-Download or open a timestamped backup directory, then verify checksums:
+The restore script downloads a backup into a secure staging directory under `/tmp`, verifies `SHA256SUMS.txt`, prints `manifest.txt`, checks `sqlite_integrity_check.txt`, creates a pre-restore backup of the current app directory, then restores the tarball. When the manifest contains original SQLite paths, it replaces tarball-restored database files with the safer `sqlite/*.backup` copies.
 
-```sh
-sha256sum -c SHA256SUMS.txt
-```
-
-Restore the full app directory by moving the existing directory aside, then extracting `${APP_NAME}-full.tar.gz` from a trusted backup.
-
-Restore SQLite databases from `sqlite/*.backup` files when available. Use matching `sqlite/*.sql` files as readable recovery fallbacks:
+Restore variables:
 
 ```sh
-sqlite3 restored.db < sqlite/001-app.db.sql
-sqlite3 restored.db 'PRAGMA integrity_check;'
+APP_NAME=zeroclaw
+APP_USER=admin
+APP_HOME=/home/admin
+APP_DIR=/home/admin/.zeroclaw
+SMB_SHARE='//172.16.172.27/zeroclaw-backups'
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw'
+SMB_REMOTE_ROOT='zeroclaw-backups'
+BACKUP_HOST=alpine-claw3
+BACKUP_TIMESTAMP=20260427_022240
+RESTORE_CONFIRM=1
 ```
 
-The expected integrity output is:
+The restore remote layout is:
 
 ```text
-ok
+${SMB_REMOTE_ROOT}/${APP_NAME}/${BACKUP_HOST}/${BACKUP_TIMESTAMP}/
 ```
+
+It also supports the duplicated-root layout created when the share and remote root have the same name:
+
+```text
+//172.16.172.27/zeroclaw-backups/zeroclaw-backups/zeroclaw/alpine-claw3/20260427_022240/
+```
+
+Dry run the latest backup:
+
+```sh
+AUTO_INSTALL_DEPS=1 \
+DRY_RUN=1 \
+RESTORE_LATEST=1 \
+APP_NAME=zeroclaw \
+APP_USER=admin \
+APP_HOME=/home/admin \
+APP_DIR=/home/admin/.zeroclaw \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/restore-app-from-share.sh
+```
+
+Restore a specific timestamp:
+
+```sh
+AUTO_INSTALL_DEPS=1 \
+RESTORE_CONFIRM=1 \
+BACKUP_HOST=alpine-claw3 \
+BACKUP_TIMESTAMP=20260427_022240 \
+APP_NAME=zeroclaw \
+APP_USER=admin \
+APP_HOME=/home/admin \
+APP_DIR=/home/admin/.zeroclaw \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/restore-app-from-share.sh
+```
+
+ZeroClaw wrapper equivalent:
+
+```sh
+RESTORE_CONFIRM=1 \
+BACKUP_HOST=alpine-claw3 \
+BACKUP_TIMESTAMP=20260427_022240 \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+./scripts/restore-zeroclaw-from-share.sh
+```
+
+Actual restores require `RESTORE_CONFIRM=1`. If `APP_DIR` already exists, the script creates:
+
+```text
+${APP_HOME}/pre-restore-${APP_NAME}-${timestamp}.tar.gz
+```
+
+Then, with `FORCE=0`, it moves the existing directory aside before extracting:
+
+```text
+${APP_DIR}.pre-restore.${timestamp}
+```
+
+Set `KEEP_STAGING=1` to keep the downloaded `/tmp/${APP_NAME}-restore-...` directory after a successful restore.
+
+Stop the app before restoring, or provide `STOP_CMD`. Provide `START_CMD` when you want the script to start the app after a successful restore. The script does not assume systemd on Alpine.
+
+SQLite `.backup` files are preferred over live tarball database captures when the manifest can be parsed safely. If the manifest cannot be parsed, the script leaves tarball-restored DBs in place and prints a warning instead of guessing.
 
 ## Security
 
