@@ -39,6 +39,18 @@ Convenience entry points:
 Alpine-specific notes:
 - The script asks for an Alpine target (`vm` or `lxc`) and changes defaults/warnings accordingly
 - LXC defaults are more conservative around UFW, Fail2Ban, AppArmor, Docker nesting, and kernel forwarding
+- Alpine LXC installs `tmux` as a standard helper tool for resilient terminal sessions during hardening and follow-up work
+- Alpine LXC ZeroClaw install is supported through an optional source build prompt. This creates a dedicated `zeroclaw` runtime user and installs ZeroClaw under `/home/zeroclaw`
+- Prebuilt `x86_64-unknown-linux-gnu` ZeroClaw binaries are GNU/glibc builds and are not suitable for Alpine/musl unless upstream provides a musl build. The Alpine path uses source build instead of `install.sh --prebuilt`
+- Recommended ZeroClaw runtime paths are `/home/zeroclaw/.zeroclaw` and `/home/zeroclaw/.cargo/bin/zeroclaw`
+- After hardening, finish ZeroClaw setup as the runtime user:
+
+  ```sh
+  su - zeroclaw
+  zeroclaw onboard
+  zeroclaw agent
+  ```
+
 - APK update automation uses `/etc/periodic/daily/` + `crond` instead of `unattended-upgrades`
 - Checkmk integration keeps the same communication/firewall flow, but Alpine installation is manual by default or via a custom `.apk` URL
 - Shared wizard/apply behavior should stay mirrored with `system_hardening.sh` unless Alpine package, init, service, or VM/LXC constraints require a distro-specific branch
@@ -113,6 +125,65 @@ For Alpine:
 - Backups: `/var/backups/homelab-hardening/<timestamp>/...`
 - Managed config writes are backup-first
 - Safe to rerun for iterative hardening/tuning
+
+## App Backups And Restores
+
+The repo includes Alpine-first, no-mount app backup tooling for TrueNAS SMB shares:
+
+- `scripts/backup-app-to-share.sh`
+- `scripts/restore-app-from-share.sh`
+- `scripts/backup-zeroclaw-to-share.sh`
+- `scripts/restore-zeroclaw-from-share.sh`
+- `scripts/backup-hermes-to-share.sh`
+
+These use `smbclient` directly and do not require CIFS/NFS mounts, which matters on Alpine or Proxmox LXC-style hosts where mounts can fail with `Operation not permitted` and `CapEff: 0000000000000000`.
+
+ZeroClaw backup example:
+
+```sh
+DEST_MODE=smbclient \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/backup-zeroclaw-to-share.sh
+```
+
+Dry run latest restore:
+
+```sh
+AUTO_INSTALL_DEPS=1 \
+DRY_RUN=1 \
+RESTORE_LATEST=1 \
+APP_NAME=zeroclaw \
+APP_USER=admin \
+APP_HOME=/home/admin \
+APP_DIR=/home/admin/.zeroclaw \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/restore-app-from-share.sh
+```
+
+Restore a specific timestamp:
+
+```sh
+AUTO_INSTALL_DEPS=1 \
+RESTORE_CONFIRM=1 \
+BACKUP_HOST=alpine-claw3 \
+BACKUP_TIMESTAMP=20260427_022240 \
+APP_NAME=zeroclaw \
+APP_USER=admin \
+APP_HOME=/home/admin \
+APP_DIR=/home/admin/.zeroclaw \
+SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
+SMB_REMOTE_ROOT='zeroclaw-backups' \
+./scripts/restore-app-from-share.sh
+```
+
+Backups may contain API keys, tokens, Telegram bot tokens, Ollama keys, SMTP secrets, databases, and app configs. Keep the TrueNAS share access-controlled and rotate exposed secrets if credential files or shell history are accidentally backed up.
+
+See `docs/app-backup-to-truenas.md` for the full backup and restore workflow.
 
 ## Validation
 

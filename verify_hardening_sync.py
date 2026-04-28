@@ -15,12 +15,26 @@ ALPINE_SCRIPT = ROOT / "system_hardening_alpine.sh"
 FUNCTION_RE = re.compile(r"^([A-Za-z0-9_]+)\(\) \{$")
 
 ALPINE_ONLY_FUNCTIONS = {
+    "apply_zeroclaw_source_install",
     "choose_deployment_target",
+    "configure_zeroclaw_prompt",
+    "download_zeroclaw_source_installer",
     "enable_service_now",
     "ensure_sshd_include_dropin",
+    "ensure_zeroclaw_directories",
+    "ensure_zeroclaw_runtime_user",
+    "ensure_zeroclaw_shell_path",
+    "install_alpine_lxc_base_packages",
+    "install_zeroclaw_source_build",
     "post_apply_services_hint",
+    "queue_zeroclaw_source_packages",
     "reload_or_restart_service",
+    "remove_bad_zeroclaw_prebuilt_if_needed",
+    "run_as_zeroclaw_user",
     "service_exists",
+    "verify_alpine_lxc_tmux_install",
+    "verify_zeroclaw_install",
+    "zeroclaw_glibc_prebuilt_detected",
 }
 
 ALLOWED_SHARED_DIFFS = {
