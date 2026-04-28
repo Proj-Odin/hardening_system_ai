@@ -185,6 +185,66 @@ Backups may contain API keys, tokens, Telegram bot tokens, Ollama keys, SMTP sec
 
 See `docs/app-backup-to-truenas.md` for the full backup and restore workflow.
 
+## LiteLLM Gateway
+
+This repo includes a hardened, rerunnable LiteLLM Gateway installer for a dedicated Debian/Ubuntu VM. The gateway is intended for LAN/Tailscale-only use in front of OpenRouter first, with local Ollama/vLLM routes added later.
+
+The LiteLLM workflow is Docker-only. It does not install LiteLLM from PyPI, requires cosign verification by default, rejects unsafe image tags such as `latest`, resolves images to immutable `sha256` digests, and generates a private Postgres-backed Compose deployment.
+
+### Which File To Use When
+
+| File | Use When | Runs On |
+|---|---|---|
+| `scripts/setup-litellm-gateway.sh` | First install or safe rerun of the gateway VM | Target Debian/Ubuntu VM |
+| `scripts/verify-litellm-gateway.sh` | Check container health, digest pinning, UFW exposure, `.env` permissions, PyPI absence, and API smoke tests | Target Debian/Ubuntu VM |
+| `scripts/update-litellm-gateway.sh` | Move to an explicit new signed LiteLLM image tag and roll back on failed verification | Target Debian/Ubuntu VM |
+| `scripts/backup-litellm-gateway.sh` | Back up Compose, config, secrets, and Postgres dump, with optional `smbclient` upload | Target Debian/Ubuntu VM |
+| `examples/litellm-gateway.env.example` | See expected environment variables and placeholder-only secret names | Reference only |
+| `examples/litellm-config.yaml.example` | See the minimal OpenRouter-backed LiteLLM config shape | Reference only |
+| `docs/litellm-gateway-hardening.md` | Full runbook: rationale, rotation, virtual keys, firewall notes, emergency response | Anywhere |
+
+### Clean VM Quickstart
+
+Use Debian 12/13 or Ubuntu 24.04. Run setup from the repo checkout on the VM:
+
+```sh
+sudo ./scripts/setup-litellm-gateway.sh \
+  --trusted-cidr 172.16.172.0/24 \
+  --bind-addr 0.0.0.0 \
+  --port 4000
+```
+
+The installer prompts for `OPENROUTER_API_KEY` if it is missing. Use a dedicated low-budget OpenRouter key, not a personal master key.
+
+After setup:
+
+```sh
+sudo /opt/litellm-gateway/verify-litellm-gateway.sh
+sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml ps
+sudo ufw status verbose
+```
+
+Point clients at:
+
+```yaml
+base_url: http://<llm-gateway-ip>:4000/v1
+model: openrouter-auto
+api_key: <LiteLLM virtual key>
+```
+
+Update with an explicit stable image tag:
+
+```sh
+sudo /opt/litellm-gateway/update-litellm-gateway.sh \
+  --image ghcr.io/berriai/litellm-non_root:v1.83.0-stable
+```
+
+Back up locally:
+
+```sh
+sudo /opt/litellm-gateway/backup-litellm-gateway.sh
+```
+
 ## Validation
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
