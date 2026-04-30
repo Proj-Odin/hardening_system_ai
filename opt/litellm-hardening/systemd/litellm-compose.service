@@ -1,0 +1,22 @@
+[Unit]
+Description=Hardened LiteLLM compose deployment
+Wants=network-online.target
+After=network-online.target docker.service podman.service
+ConditionPathExists=/etc/litellm-hardening/litellm.env
+ConditionPathExists=/opt/litellm-hardening/compose/active.compose.yaml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/litellm-hardening
+EnvironmentFile=/etc/litellm-hardening/litellm.env
+UMask=0077
+ExecStartPre=/opt/litellm-hardening/validate-litellm.sh --preflight
+ExecStart=/usr/bin/env bash -lc 'set -euo pipefail; "${CONTAINER_RUNTIME:-docker}" compose -p "${COMPOSE_PROJECT_NAME:-litellm}" -f /opt/litellm-hardening/compose/active.compose.yaml up -d --remove-orphans'
+ExecReload=/usr/bin/env bash -lc 'set -euo pipefail; "${CONTAINER_RUNTIME:-docker}" compose -p "${COMPOSE_PROJECT_NAME:-litellm}" -f /opt/litellm-hardening/compose/active.compose.yaml up -d --remove-orphans'
+ExecStop=/usr/bin/env bash -lc 'set -euo pipefail; "${CONTAINER_RUNTIME:-docker}" compose -p "${COMPOSE_PROJECT_NAME:-litellm}" -f /opt/litellm-hardening/compose/active.compose.yaml down'
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
