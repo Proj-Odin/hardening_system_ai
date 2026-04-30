@@ -1,0 +1,56 @@
+services:
+  litellm:
+    image: "${LITELLM_IMAGE_REPO}@${LITELLM_IMAGE_DIGEST}"
+    container_name: litellm
+    restart: unless-stopped
+    init: true
+    user: "${LITELLM_RUNTIME_UID}:${LITELLM_RUNTIME_GID}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    env_file:
+      - /etc/litellm-hardening/litellm.env
+    command:
+      - "--port"
+      - "4000"
+      - "--config"
+      - "/app/config.yaml"
+      - "--num_workers"
+      - "${LITELLM_NUM_WORKERS}"
+      - "--run_gunicorn"
+    ports:
+      - "${LITELLM_BIND_ADDRESS}:${LITELLM_BIND_PORT}:4000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health', timeout=5)"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    volumes:
+      - type: bind
+        source: /opt/litellm-hardening/litellm_config.yaml
+        target: /app/config.yaml
+        read_only: true
+      - type: bind
+        source: ${LITELLM_MIGRATION_DIR}
+        target: /app/migrations
+      - type: bind
+        source: ${XDG_CACHE_HOME}
+        target: /app/cache
+    networks:
+      - litellm_internal
+
+networks:
+  litellm_internal:
+    driver: bridge

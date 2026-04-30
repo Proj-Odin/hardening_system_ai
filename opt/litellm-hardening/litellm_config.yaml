@@ -1,0 +1,46 @@
+# API-first production config.
+# Secrets stay in /etc/litellm-hardening/litellm.env and are referenced here.
+
+model_list: []
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  alerting: []
+  proxy_batch_write_at: 60
+  database_connection_pool_limit: 10
+  disable_error_logs: true
+  disable_spend_logs: true
+  disable_end_user_cost_tracking: true
+  allow_requests_on_db_unavailable: false
+  store_prompts_in_spend_logs: false
+  store_model_in_db: true
+  enforce_user_param: true
+  # Uncomment only after confirming your pinned LiteLLM release supports it.
+  # reject_clientside_metadata_tags: true
+
+litellm_settings:
+  request_timeout: 600
+  set_verbose: false
+  json_logs: true
+  cache: false
+
+router_settings:
+  routing_strategy: simple-shuffle
+
+# Uncomment only if you have an existing Redis instance and explicitly want caching.
+# router_settings:
+#   routing_strategy: simple-shuffle
+#   redis_host: os.environ/REDIS_HOST
+#   redis_port: os.environ/REDIS_PORT
+#   redis_password: os.environ/REDIS_PASSWORD
+#   redis_db: os.environ/REDIS_DB
+#
+# litellm_settings:
+#   cache: true
+#   cache_params:
+#     type: redis
+#     host: os.environ/REDIS_HOST
+#     port: os.environ/REDIS_PORT
+#     password: os.environ/REDIS_PASSWORD
+#     db: os.environ/REDIS_DB

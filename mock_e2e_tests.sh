@@ -67,6 +67,10 @@ shell_scripts=(
     setup.sh
     setup_v1.5.sh
     test_ssh_port_detection.sh
+    scripts/setup-litellm-gateway.sh
+    scripts/update-litellm-gateway.sh
+    scripts/verify-litellm-gateway.sh
+    scripts/backup-litellm-gateway.sh
     mock_e2e_tests.sh
 )
 syntax_pass=0
