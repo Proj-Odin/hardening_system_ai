@@ -1,305 +1,299 @@
 # LiteLLM Gateway Hardening
 
-This guide describes the dedicated Debian/Ubuntu VM deployment created by:
+This runbook covers a Docker-only LiteLLM gateway that fronts trusted LAN or Tailscale clients and routes Ollama-compatible models through a host Ollama daemon. The working architecture is:
+
+```text
+OpenAI-compatible client
+  -> LiteLLM Gateway on Debian/Ubuntu
+  -> host Ollama daemon bridge
+  -> Ollama Cloud models
+```
+
+Postgres is private to Docker. LiteLLM is exposed only on the configured `LITELLM_PORT`, and firewall rules must restrict that port to `TRUSTED_CLIENT_CIDR`.
+
+## Files
 
 - `scripts/setup-litellm-gateway.sh`
-- `scripts/update-litellm-gateway.sh`
+- `scripts/configure-ollama-cloud-bridge.sh`
 - `scripts/verify-litellm-gateway.sh`
+- `scripts/verify-ollama-cloud-bridge.sh`
+- `scripts/create-litellm-client-key.sh`
+- `scripts/update-litellm-gateway.sh`
 - `scripts/backup-litellm-gateway.sh`
-
-The VM acts as a LAN/Tailscale-only AI gateway in front of OpenRouter first, with room for local Ollama or vLLM later.
-
-## What This Installs
-
-- Docker and the Docker Compose plugin
-- `cosign` for image signature verification
-- UFW rules for SSH and trusted-CIDR-only LiteLLM access
-- DOCKER-USER chain rules to reduce Docker published-port bypass of UFW
-- `/opt/litellm-gateway/docker-compose.yml`
+- `/opt/litellm-gateway/.env`: protected secrets
+- `/opt/litellm-gateway/gateway.env`: non-secret deployment network settings
 - `/opt/litellm-gateway/config/config.yaml`
-- `/opt/litellm-gateway/.env`
-- A LiteLLM container and a private Postgres container
-- Local backups under `/opt/litellm-gateway/backups`
+- `/opt/litellm-gateway/docker-compose.yml`
 
-Postgres is not published to the LAN. LiteLLM is bound to the configured `BIND_ADDR:LITELLM_PORT` and then restricted with UFW plus DOCKER-USER rules.
+## Network Variables
 
-## Why Docker, Not PyPI
+Do not bake lab addresses into scripts or docs. The setup and bridge scripts accept flags and prompt when values are missing.
 
-The March 2026 LiteLLM PyPI compromise affected malicious `litellm` versions `1.82.7` and `1.82.8`. Those releases reportedly harvested secrets and added persistence. This installer therefore never installs LiteLLM from PyPI and fails verification if host PyPI LiteLLM is detected.
+Required or commonly saved values:
 
-LiteLLM's public docs state that GHCR Docker images are signed with cosign and show the pinned public key URL introduced at commit `0112e53046018d726492c814b3644b7d376029d0`:
+- `LITELLM_HOST_IP`: LAN/Tailscale IP clients use for LiteLLM.
+- `LITELLM_PORT`: client-facing LiteLLM port. Default prompt value is `4000`.
+- `TRUSTED_CLIENT_CIDR`: subnet or single-client `/32` allowed to reach LiteLLM.
+- `OLLAMA_BRIDGE_API_BASE`: URL LiteLLM uses from inside the container to reach host Ollama.
+- `DOCKER_LITELLM_SUBNET`: Docker subnet allowed to reach host Ollama.
+- `OLLAMA_HOST_BIND`: Ollama service bind, default `0.0.0.0:11434`; firewall rules must keep it private.
+- `ZEROCLAW_HOST_IP`: optional, only for targeted examples/tests.
 
-```sh
-cosign verify \
-  --key https://raw.githubusercontent.com/BerriAI/litellm/0112e53046018d726492c814b3644b7d376029d0/cosign.pub \
-  ghcr.io/berriai/litellm:<release-tag>
-```
-
-The setup and update scripts use the same key URL and verify before running the image. They then resolve the pulled image to a `sha256` digest and write the digest into Compose, so the VM does not later drift to a different mutable tag. They also reject LiteLLM image references outside these signed BerriAI GHCR repositories:
-
-- `ghcr.io/berriai/litellm`
-- `ghcr.io/berriai/litellm-non_root`
-- `ghcr.io/berriai/litellm-database`
-
-Sources:
-
-- LiteLLM Docker signature docs: https://berriai.github.io/litellm/#verify-docker-image-signatures
-- Sigstore cosign install docs: https://docs.sigstore.dev/cosign/system_config/installation/
-- PyPI incident reference: https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-teampcp-supply-chain-campaign/
-
-This does not make supply-chain risk impossible. It reduces blast radius by avoiding host PyPI install paths, requiring signatures by default, pinning digests, limiting network exposure, and keeping provider keys scoped.
-
-## Image Choice
-
-Default:
+Example-only `gateway.env` values:
 
 ```sh
-ghcr.io/berriai/litellm-non_root:v1.83.0-stable
+LITELLM_HOST_IP=192.168.1.50
+LITELLM_PORT=4000
+TRUSTED_CLIENT_CIDR=192.168.1.0/24
+OLLAMA_BRIDGE_API_BASE=http://172.30.0.1:11434
+DOCKER_LITELLM_SUBNET=172.30.0.0/16
+OLLAMA_HOST_BIND=0.0.0.0:11434
 ```
 
-The non-root image is preferred. If LiteLLM key management or database migrations require a database-specific image in your chosen release, set `LITELLM_IMAGE` explicitly to a stable GHCR image and let the installer verify the same cosign signature before digest pinning.
+Use your detected Docker network gateway and subnet, not these example-only values.
 
-LiteLLM's virtual key support requires Postgres plus `master_key` and `database_url` in `general_settings`. Some LiteLLM docs historically refer to a database-specific Dockerfile for proxy key management. This installer starts with the signed non-root image and Postgres; if `/key/generate` or migrations fail for a specific release, switch to a matching stable `ghcr.io/berriai/litellm-database:<version>-stable` image and rerun setup/update. The cosign and digest rules still apply.
+## Supply-Chain Posture
 
-The scripts refuse image tags containing:
+The March 2026 LiteLLM PyPI compromise affected malicious `litellm` versions `1.82.7` and `1.82.8`. This gateway never installs LiteLLM from PyPI and verification fails if host PyPI LiteLLM is detected.
 
-- `latest`
-- `main-latest`
-- `nightly`
-- `dev`
+The default image is the known working post-incident signed image:
 
-The setup script also keeps `config.yaml` non-world-readable while adjusting its owner to the verified container image's runtime UID/GID. That keeps the bind-mounted config readable to non-root LiteLLM images without making it world-readable on the host.
+```sh
+ghcr.io/berriai/litellm-non_root:v1.83.3-stable.patch.2
+```
 
-## Install On A Clean VM
+The earlier generated default `ghcr.io/berriai/litellm-non_root:v1.83.0-stable` failed to pull and should not be used.
 
-Use Debian 12/13 or Ubuntu 24.04.
+Setup and update still:
+
+- reject `latest`, `main-latest`, `nightly`, and `dev` tags
+- allow only signed BerriAI GHCR LiteLLM repositories
+- verify the LiteLLM image with `cosign` by default
+- resolve the image to an immutable `sha256` digest
+- write Docker Compose with the digest
+
+## Runtime Corrections
+
+The generated Compose file keeps the config bind mount read-only:
+
+```yaml
+volumes:
+  - type: bind
+    source: /opt/litellm-gateway/config/config.yaml
+    target: /app/config.yaml
+    read_only: true
+```
+
+The LiteLLM service filesystem is intentionally not fully read-only:
+
+```yaml
+read_only: false
+mem_limit: 2g
+```
+
+LiteLLM/Prisma writes cache, migration, and sanity-check files during startup. A fully read-only service filesystem can leave the process started but with no port open and empty logs. The memory limit is `2g` because startup can approach the old `1g` budget.
+
+Health checks use:
+
+```text
+/health/liveliness
+```
+
+Do not use unauthenticated `/health` as the primary readiness check. Some LiteLLM builds return `401 Unauthorized` for `/health` while `/health/liveliness` returns `200 OK`.
+
+## Install
+
+Interactive:
 
 ```sh
 sudo ./scripts/setup-litellm-gateway.sh
 ```
 
-Useful explicit form:
+Non-interactive example:
 
 ```sh
-sudo LITELLM_IMAGE='ghcr.io/berriai/litellm-non_root:v1.83.0-stable' \
-  ./scripts/setup-litellm-gateway.sh \
-  --trusted-cidr 172.16.172.0/24 \
-  --bind-addr 0.0.0.0 \
-  --port 4000
+sudo ./scripts/setup-litellm-gateway.sh \
+  --litellm-host-ip <LITELLM_HOST_IP> \
+  --litellm-port <LITELLM_PORT> \
+  --trusted-client-cidr <TRUSTED_CLIENT_CIDR> \
+  --ollama-bridge-api-base <OLLAMA_BRIDGE_API_BASE> \
+  --docker-litellm-subnet <DOCKER_LITELLM_SUBNET> \
+  --yes
 ```
 
-The installer prompts for `OPENROUTER_API_KEY` if it is missing. Use a dedicated low-budget OpenRouter key for this gateway, not a personal master key.
+The setup script prompts for an optional `OPENROUTER_API_KEY`. Leave it blank unless you want the `openrouter-auto` route.
 
-After setup:
+## Ollama Cloud Bridge
+
+Configure the host Ollama daemon:
+
+```sh
+sudo /opt/litellm-gateway/configure-ollama-cloud-bridge.sh
+```
+
+Useful flags:
+
+```sh
+sudo /opt/litellm-gateway/configure-ollama-cloud-bridge.sh \
+  --ollama-bridge-api-base <OLLAMA_BRIDGE_API_BASE> \
+  --docker-litellm-subnet <DOCKER_LITELLM_SUBNET> \
+  --yes
+```
+
+The script:
+
+- checks whether `ollama` is installed
+- installs Ollama only when `--install-ollama` is passed
+- prints the Ollama version
+- detects the `ollama` service account and service home
+- prints the service public key path, normally `/usr/share/ollama/.ollama/id_ed25519.pub`
+- tells you to add that public key at `https://ollama.com/settings/keys`
+- does not copy an admin private key by default
+- supports emergency `--copy-admin-key` with a warning
+- writes `/etc/systemd/system/ollama.service.d/override.conf`
+- restarts Ollama
+- verifies port `11434` is listening
+- detects or prompts for the Docker subnet
+- adds a UFW rule allowing only `DOCKER_LITELLM_SUBNET` to reach port `11434`
+
+The systemd override uses:
+
+```ini
+[Service]
+Environment="OLLAMA_HOST=<OLLAMA_HOST_BIND>"
+```
+
+Keep `11434` private. The listener can bind broadly, but firewall rules must restrict it to trusted Docker or LAN intent.
+
+## Models
+
+Generated `config.yaml` uses the selected `OLLAMA_BRIDGE_API_BASE` for:
+
+- `ollama-gpt-oss-cloud`
+- `ollama-kimi-k26-cloud`
+- `ollama-glm-51-cloud`
+- `ollama-deepseek-v4-pro-cloud`
+- `ollama-gemma4-31b-cloud`
+- `ollama-nemotron-3-super-cloud`
+- `embed-nomic`
+- `embed-embeddinggemma`
+- `embed-qwen3`
+
+Chat cloud models are offloaded through Ollama Cloud. Embedding models are local Ollama models unless you explicitly configure a cloud embedding model.
+
+Pull local embedding models before testing:
+
+```sh
+ollama pull nomic-embed-text
+ollama pull embeddinggemma
+ollama pull qwen3-embedding
+```
+
+`embed-nomic` and `embed-embeddinggemma` have been tested successfully through LiteLLM when the local models are present. `embed-qwen3` is configured but should be pulled and tested separately.
+
+## Verification
+
+LiteLLM checks:
 
 ```sh
 sudo /opt/litellm-gateway/verify-litellm-gateway.sh
-sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml ps
-sudo ufw status verbose
 ```
 
-The verification script runs a tiny OpenRouter-routed chat completion by default. To avoid provider spend during a smoke check, run:
+Bridge checks:
 
 ```sh
-sudo SKIP_PROVIDER_TEST=1 /opt/litellm-gateway/verify-litellm-gateway.sh
+sudo /opt/litellm-gateway/verify-ollama-cloud-bridge.sh
 ```
 
-## Update
+The verification flow checks:
 
-Updates require an explicit image target.
+- Docker Compose health for LiteLLM and Postgres
+- digest-pinned images
+- `.env` and `gateway.env` permissions
+- no host PyPI LiteLLM package
+- unauthenticated `http://127.0.0.1:<LITELLM_PORT>/health/liveliness`
+- authenticated `/v1/models`
+- chat completion with `ollama-kimi-k26-cloud`, falling back to `ollama-gpt-oss-cloud`
+- host Ollama `/api/tags`
+- host access through `OLLAMA_BRIDGE_API_BASE`
+- LiteLLM container access to host Ollama
+- direct Ollama cloud chat
+- LiteLLM chat through the Ollama bridge
+- LiteLLM embeddings through local Ollama
+
+## Client Virtual Keys
+
+Do not put `LITELLM_MASTER_KEY` in clients. Create scoped virtual keys:
 
 ```sh
-sudo /opt/litellm-gateway/update-litellm-gateway.sh \
-  --image ghcr.io/berriai/litellm-non_root:v1.83.0-stable
+sudo /opt/litellm-gateway/create-litellm-client-key.sh --alias zeroclaw
 ```
 
-The update script:
+By default the key includes:
 
-1. Rejects unsafe tags.
-2. Pulls the image.
-3. Verifies the cosign signature.
-4. Resolves the digest.
-5. Backs up compose/config/env metadata.
-6. Replaces only the LiteLLM image digest.
-7. Starts Compose.
-8. Runs verification.
-9. Rolls back the compose file if verification fails.
+- all configured Ollama cloud chat models
+- `embed-nomic`
+- `embed-embeddinggemma`
+- `embed-qwen3`
 
-## Backup
+It excludes `openrouter-auto` unless `--include-openrouter` is passed.
 
-Local backup:
+The response field named `key` is the client API key. `token_id` is not the API key.
+
+## Startup After Snapshot Or Reboot
+
+Enable Docker:
 
 ```sh
-sudo /opt/litellm-gateway/backup-litellm-gateway.sh
+sudo systemctl enable docker
 ```
 
-Backup contents:
-
-- `docker-compose.yml`
-- `config/config.yaml`
-- `.env` as `env.gpg` when `BACKUP_GPG_RECIPIENT` is set and `gpg` is available, otherwise `env.SENSITIVE`
-- Postgres dump when the database container is reachable
-- `SHA256SUMS.txt`
-- `litellm-gateway-backup.tar.gz`
-
-Optional no-mount SMB upload:
+Start the stack:
 
 ```sh
-sudo SMB_SHARE='//truenas/litellm-backups' \
-  SMB_CREDS='/root/.smbcredentials/litellm-backups' \
-  SMB_REMOTE_DIR='litellm-gateway' \
-  /opt/litellm-gateway/backup-litellm-gateway.sh
-```
-
-This uses `smbclient` directly and does not require CIFS/NFS mounts.
-
-## Rotate OpenRouter Key
-
-1. Create a new low-budget OpenRouter key.
-2. Edit `/opt/litellm-gateway/.env` and replace `OPENROUTER_API_KEY`.
-3. Keep permissions strict:
-
-```sh
-sudo chmod 600 /opt/litellm-gateway/.env
 sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml up -d
-sudo /opt/litellm-gateway/verify-litellm-gateway.sh
 ```
 
-4. Revoke the old OpenRouter key after verification.
-
-## Rotate LiteLLM Master Key
-
-The master key controls admin-level access to the proxy. Rotate carefully:
-
-1. Back up first:
+Check it:
 
 ```sh
-sudo /opt/litellm-gateway/backup-litellm-gateway.sh
+sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml ps
 ```
 
-2. Replace `LITELLM_MASTER_KEY` in `/opt/litellm-gateway/.env` with a new `sk-...` value.
-3. Restart Compose.
-4. Recreate or verify virtual keys as needed.
-5. Update clients only if they use the master key directly. Normal clients should use virtual keys.
+Compose services use `restart: unless-stopped`, but after snapshots or host maintenance still confirm the stack is actually running.
 
-## Virtual Keys
+## Acceptance Criteria
 
-Create separate virtual keys for each client so budgets and incident response are cleanly scoped.
+After setup and bridge configuration:
 
-Recommended budgets:
+- `docker compose ps` shows LiteLLM healthy
+- `docker compose ps` shows Postgres healthy
+- `/health/liveliness` returns `200`
+- `/v1/models` with the master key returns all configured models
+- `/v1/models` with a scoped client key excludes `openrouter-auto` unless explicitly included
+- LiteLLM chat with `ollama-kimi-k26-cloud` returns the expected text
+- LiteLLM embeddings with `embed-nomic` return an embedding vector
+- LiteLLM embeddings with `embed-embeddinggemma` return an embedding vector if the model is pulled
+- trusted clients can reach `/v1/models` using a virtual client key
+- trusted clients can reach `/v1/chat/completions` using a virtual client key
 
-- Tiny test key: very low daily/monthly cap
-- ZeroClaw key: cap sized for normal ZeroClaw workload
-- OpenClaw key: separate cap and alias
-- NemoClaw key: separate cap and alias if used
+## Known Failure Symptoms
 
-Example master-key calls:
+- Empty Docker logs plus no port `4000`: likely a fully read-only LiteLLM filesystem.
+- LiteLLM health stuck: check `/health` versus `/health/liveliness`.
+- Ollama CLI works but local API returns unauthorized: the daemon runs as the `ollama` user and its service public key must be added at `https://ollama.com/settings/keys`.
+- Container cannot reach host Ollama: check `OLLAMA_HOST=<OLLAMA_HOST_BIND>` and the UFW rule for `<DOCKER_LITELLM_SUBNET>`.
+- Client cannot reach LiteLLM: make sure the stack is running and UFW allows `<TRUSTED_CLIENT_CIDR>` to `<LITELLM_PORT>/tcp`.
+- `/v1/models` works but chat returns empty content: increase `max_tokens`; reasoning models may consume tiny token budgets.
 
-```sh
-export LITELLM_BASE='http://<llm-gateway-ip>:4000'
-export LITELLM_MASTER_KEY='sk-...'
+## Security Posture
 
-curl -sS -X POST "$LITELLM_BASE/key/generate" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias":"zeroclaw","models":["openrouter-auto"],"max_budget":10,"budget_duration":"30d"}'
-
-curl -sS -X POST "$LITELLM_BASE/key/generate" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias":"openclaw","models":["openrouter-auto"],"max_budget":10,"budget_duration":"30d"}'
-
-curl -sS -X POST "$LITELLM_BASE/key/generate" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias":"nemoclaw","models":["openrouter-auto"],"max_budget":10,"budget_duration":"30d"}'
-
-curl -sS -X POST "$LITELLM_BASE/key/generate" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias":"testing","models":["openrouter-auto"],"max_budget":1,"budget_duration":"7d"}'
-```
-
-Store returned virtual keys in each app's secret store, not in shell history.
-
-## Point ZeroClaw/OpenClaw/NemoClaw At LiteLLM
-
-Use the OpenAI-compatible endpoint:
-
-```yaml
-base_url: http://<llm-gateway-ip>:4000/v1
-model: openrouter-auto
-api_key: <the app-specific LiteLLM virtual key>
-```
-
-Do not give apps the LiteLLM master key unless you are intentionally doing admin work.
-
-## Check Spend And Logs
-
-Container logs:
-
-```sh
-sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml logs -f litellm
-```
-
-Spend/key metadata can be inspected through LiteLLM admin endpoints with the master key. Keep these calls on the LAN/Tailscale side of the network.
-
-Examples:
-
-```sh
-curl -sS "$LITELLM_BASE/key/info" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY"
-
-curl -sS "$LITELLM_BASE/spend/logs" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY"
-```
-
-## Firewall Notes
-
-Docker can bypass normal UFW for published ports. The setup script uses both:
-
-1. UFW: allows SSH and allows the LiteLLM port only from `TRUSTED_CIDR`.
-2. DOCKER-USER chain: returns trusted CIDR traffic to Docker and drops other forwarded traffic to the LiteLLM container port.
-
-Docker applies DNAT before packets reach `DOCKER-USER`, so the helper protects the container port `4000`. UFW still protects the configured host-side `LITELLM_PORT`.
-
-The DOCKER-USER helper is installed at:
-
-```sh
-/usr/local/sbin/litellm-gateway-docker-user-rules
-```
-
-and persisted with:
-
-```sh
-litellm-gateway-firewall.service
-```
-
-Review firewall state:
-
-```sh
-sudo ufw status verbose
-sudo iptables -S DOCKER-USER
-```
-
-## Optional Egress Control
-
-The setup script always creates:
-
-```sh
-/opt/litellm-gateway/egress-allowlist.txt
-```
-
-With `--strict-egress`, it also creates a router firewall plan. It does not install brittle domain-to-IP fail-closed host rules by default because provider domains can move across CDNs. Enforce strict egress at your router/firewall if you want a fail-closed model.
-
-## Emergency Response For Bad PyPI LiteLLM
-
-If LiteLLM PyPI versions `1.82.7` or `1.82.8` were ever installed or run on a host:
-
-1. Treat the host as compromised.
-2. Rotate all secrets visible to the host or containers, including provider API keys, LiteLLM keys, database passwords, SSH keys, CI tokens, and cloud credentials.
-3. Rebuild the VM from clean media.
-4. Restore only known-good config and database backups.
-5. Check Python site-packages for `litellm_init.pth` and other incident indicators before trusting any artifact.
-
-Upgrading the Python package alone is not enough if persistence or credential theft may have occurred.
+- Do not expose LiteLLM to the public internet.
+- Allow only LAN/Tailscale clients.
+- Do not expose Ollama port `11434` publicly.
+- Use LiteLLM virtual keys for clients.
+- Do not use `LITELLM_MASTER_KEY` in client apps.
+- Keep provider and cloud keys out of client configs.
+- Keep `/opt/litellm-gateway/.env` mode `600`.
+- Keep `config.yaml` mounted read-only.
+- Keep image digest pinning and cosign verification enabled.

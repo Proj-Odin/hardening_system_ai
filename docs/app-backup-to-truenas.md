@@ -73,7 +73,7 @@ Do not put SMB passwords directly in commands, cron, or generated env files.
 Test SMB access:
 
 ```sh
-smbclient //172.16.172.27/zeroclaw-backups -A /home/admin/.smbcredentials/truenas-zeroclaw -c 'ls'
+smbclient //SMB_HOST/zeroclaw-backups -A /home/admin/.smbcredentials/truenas-zeroclaw -c 'ls'
 ```
 
 If the script says the credentials file is not readable, copy a root-owned credential into the user-readable path:
@@ -91,7 +91,7 @@ APP_NAME=myapp \
 APP_USER=admin \
 APP_HOME=/home/admin \
 APP_DIR=/home/admin/myapp \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' \
 ./scripts/backup-app-to-share.sh
 ```
@@ -110,7 +110,7 @@ Dry run:
 DRY_RUN=1 \
 APP_NAME=myapp \
 APP_DIR=/home/admin/myapp \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' \
 ./scripts/backup-app-to-share.sh
 ```
@@ -139,7 +139,7 @@ AUTO_INSTALL_DEPS=0
 SMB mode:
 
 ```sh
-SMB_SHARE='//172.16.172.27/zeroclaw-backups'
+SMB_SHARE='//SMB_HOST/zeroclaw-backups'
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw'
 SMB_REMOTE_ROOT=''
 SMB_HOST_DIR=''
@@ -184,13 +184,13 @@ It uses `sudo` when not running as root and `sudo` exists. It does not attempt `
 ZeroClaw:
 
 ```cron
-30 2 * * * DEST_MODE=smbclient SMB_SHARE='//172.16.172.27/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-zeroclaw-to-share.sh >> /home/admin/zeroclaw-backup.log 2>&1
+30 2 * * * DEST_MODE=smbclient SMB_SHARE='//SMB_HOST/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-zeroclaw-to-share.sh >> /home/admin/zeroclaw-backup.log 2>&1
 ```
 
 Hermes:
 
 ```cron
-45 2 * * * DEST_MODE=smbclient APP_DIR=/home/admin/hermes SMB_SHARE='//172.16.172.27/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-hermes-to-share.sh >> /home/admin/hermes-backup.log 2>&1
+45 2 * * * DEST_MODE=smbclient APP_DIR=/home/admin/hermes SMB_SHARE='//SMB_HOST/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-hermes-to-share.sh >> /home/admin/hermes-backup.log 2>&1
 ```
 
 ## Restore
