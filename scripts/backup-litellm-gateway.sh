@@ -5,6 +5,7 @@ umask 077
 
 APP_DIR="${APP_DIR:-/opt/litellm-gateway}"
 ENV_FILE="${APP_DIR}/.env"
+GATEWAY_ENV_FILE="${APP_DIR}/gateway.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 CONFIG_FILE="${APP_DIR}/config/config.yaml"
 BACKUP_ROOT="${APP_DIR}/backups"
@@ -31,10 +32,11 @@ die() {
   exit 1
 }
 
-get_env_value() {
-  local key="$1"
+get_file_value() {
+  local file="$1"
+  local key="$2"
   local value
-  [ -f "$ENV_FILE" ] || return 0
+  [ -f "$file" ] || return 0
   value="$(awk -F= -v key="$key" '
     /^[[:space:]]*#/ || $0 !~ /=/ { next }
     {
@@ -47,7 +49,7 @@ get_env_value() {
         exit
       }
     }
-  ' "$ENV_FILE")"
+  ' "$file")"
   value="${value%$'\r'}"
   case "$value" in
     \"*\") value="${value#\"}"; value="${value%\"}" ;;
@@ -56,12 +58,21 @@ get_env_value() {
   printf '%s\n' "$value"
 }
 
+get_env_value() {
+  get_file_value "$ENV_FILE" "$1"
+}
+
+get_gateway_value() {
+  get_file_value "$GATEWAY_ENV_FILE" "$1"
+}
+
 load_env() {
   local env_project
   local env_pg_user
   local env_pg_db
   local env_pg_password
-  env_project="$(get_env_value COMPOSE_PROJECT_NAME)"
+  env_project="$(get_gateway_value COMPOSE_PROJECT_NAME)"
+  [ -n "$env_project" ] || env_project="$(get_env_value COMPOSE_PROJECT_NAME)"
   env_pg_user="$(get_env_value POSTGRES_USER)"
   env_pg_db="$(get_env_value POSTGRES_DB)"
   env_pg_password="$(get_env_value POSTGRES_PASSWORD)"
@@ -80,6 +91,7 @@ copy_metadata() {
   mkdir -p "${dest}/config" "${dest}/db"
   [ -f "$COMPOSE_FILE" ] && cp -a "$COMPOSE_FILE" "${dest}/docker-compose.yml"
   [ -f "$CONFIG_FILE" ] && cp -a "$CONFIG_FILE" "${dest}/config/config.yaml"
+  [ -f "$GATEWAY_ENV_FILE" ] && cp -a "$GATEWAY_ENV_FILE" "${dest}/gateway.env"
 
   if [ -f "$ENV_FILE" ]; then
     if command -v gpg >/dev/null 2>&1 && [ -n "${BACKUP_GPG_RECIPIENT:-}" ]; then
@@ -117,6 +129,7 @@ App dir: ${APP_DIR}
 Includes:
 - docker-compose.yml
 - config/config.yaml
+- gateway.env when present
 - env.SENSITIVE or env.gpg when present
 - db/litellm.sql.gz when Postgres dump succeeds
 EOF

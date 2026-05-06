@@ -142,7 +142,7 @@ ZeroClaw backup example:
 
 ```sh
 DEST_MODE=smbclient \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/backup-zeroclaw-to-share.sh
@@ -158,7 +158,7 @@ APP_NAME=zeroclaw \
 APP_USER=admin \
 APP_HOME=/home/admin \
 APP_DIR=/home/admin/.zeroclaw \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/restore-app-from-share.sh
@@ -175,7 +175,7 @@ APP_NAME=zeroclaw \
 APP_USER=admin \
 APP_HOME=/home/admin \
 APP_DIR=/home/admin/.zeroclaw \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/restore-app-from-share.sh
@@ -197,11 +197,16 @@ The LiteLLM workflow is Docker-only. It does not install LiteLLM from PyPI, requ
 |---|---|---|
 | `scripts/setup-litellm-gateway.sh` | First install or safe rerun of the gateway VM | Target Debian/Ubuntu VM |
 | `scripts/verify-litellm-gateway.sh` | Check container health, digest pinning, UFW exposure, `.env` permissions, PyPI absence, and API smoke tests | Target Debian/Ubuntu VM |
+| `scripts/configure-ollama-cloud-bridge.sh` | Configure host Ollama as the private bridge used by LiteLLM | Target Debian/Ubuntu VM |
+| `scripts/verify-ollama-cloud-bridge.sh` | Verify host Ollama, container reachability, chat, and embeddings through the bridge | Target Debian/Ubuntu VM |
+| `scripts/create-litellm-client-key.sh` | Create scoped LiteLLM virtual keys for clients | Target Debian/Ubuntu VM |
 | `scripts/update-litellm-gateway.sh` | Move to an explicit new signed LiteLLM image tag and roll back on failed verification | Target Debian/Ubuntu VM |
 | `scripts/backup-litellm-gateway.sh` | Back up Compose, config, secrets, and Postgres dump, with optional `smbclient` upload | Target Debian/Ubuntu VM |
 | `examples/litellm-gateway.env.example` | See expected environment variables and placeholder-only secret names | Reference only |
-| `examples/litellm-config.yaml.example` | See the minimal OpenRouter-backed LiteLLM config shape | Reference only |
+| `examples/litellm-gateway.gateway.env.example` | See non-secret network settings saved to `/opt/litellm-gateway/gateway.env` | Reference only |
+| `examples/litellm-config.yaml.example` | See the Ollama bridge model config shape | Reference only |
 | `docs/litellm-gateway-hardening.md` | Full runbook: rationale, rotation, virtual keys, firewall notes, emergency response | Anywhere |
+| `docs/zeroclaw-litellm-integration.md` | Generic ZeroClaw/OpenAI-compatible client setup through LiteLLM | Anywhere |
 
 ### Clean VM Quickstart
 
@@ -209,17 +214,21 @@ Use Debian 12/13 or Ubuntu 24.04. Run setup from the repo checkout on the VM:
 
 ```sh
 sudo ./scripts/setup-litellm-gateway.sh \
-  --trusted-cidr 172.16.172.0/24 \
-  --bind-addr 0.0.0.0 \
-  --port 4000
+  --litellm-host-ip <LITELLM_HOST_IP> \
+  --litellm-port <LITELLM_PORT> \
+  --trusted-client-cidr <TRUSTED_CLIENT_CIDR> \
+  --ollama-bridge-api-base <OLLAMA_BRIDGE_API_BASE> \
+  --docker-litellm-subnet <DOCKER_LITELLM_SUBNET>
 ```
 
-The installer prompts for `OPENROUTER_API_KEY` if it is missing. Use a dedicated low-budget OpenRouter key, not a personal master key.
+The installer prompts for missing network values and for an optional `OPENROUTER_API_KEY`. Leave OpenRouter blank unless you intentionally want the `openrouter-auto` route.
 
 After setup:
 
 ```sh
 sudo /opt/litellm-gateway/verify-litellm-gateway.sh
+sudo /opt/litellm-gateway/configure-ollama-cloud-bridge.sh
+sudo /opt/litellm-gateway/verify-ollama-cloud-bridge.sh
 sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml ps
 sudo ufw status verbose
 ```
@@ -227,8 +236,8 @@ sudo ufw status verbose
 Point clients at:
 
 ```yaml
-base_url: http://<llm-gateway-ip>:4000/v1
-model: openrouter-auto
+base_url: http://<LITELLM_HOST_IP>:<LITELLM_PORT>/v1
+model: ollama-kimi-k26-cloud
 api_key: <LiteLLM virtual key>
 ```
 
@@ -236,7 +245,7 @@ Update with an explicit stable image tag:
 
 ```sh
 sudo /opt/litellm-gateway/update-litellm-gateway.sh \
-  --image ghcr.io/berriai/litellm-non_root:v1.83.0-stable
+  --image ghcr.io/berriai/litellm-non_root:v1.83.3-stable.patch.2
 ```
 
 Back up locally:
