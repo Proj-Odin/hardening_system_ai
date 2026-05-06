@@ -6,6 +6,8 @@ umask 077
 APP_DIR="${APP_DIR:-/opt/litellm-gateway}"
 ENV_FILE="${APP_DIR}/.env"
 GATEWAY_ENV_FILE="${APP_DIR}/gateway.env"
+CONFIG_FILE="${APP_DIR}/config/config.yaml"
+COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-litellm-gateway}"
 LITELLM_HOST_IP="${LITELLM_HOST_IP:-}"
 LITELLM_PORT="${LITELLM_PORT:-}"
@@ -18,6 +20,7 @@ BIND_ADDR="${BIND_ADDR:-}"
 LITELLM_IMAGE="${LITELLM_IMAGE:-}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-}"
 LITELLM_READ_ONLY="${LITELLM_READ_ONLY:-}"
+PREVIOUS_OLLAMA_BRIDGE_API_BASE=""
 INSTALL_OLLAMA=0
 COPY_ADMIN_KEY=0
 INTERACTIVE=0
@@ -155,23 +158,32 @@ get_file_value() {
   printf '%s\n' "$value"
 }
 
+get_gateway_value_safe() {
+  if declare -F read_gateway_env_value >/dev/null 2>&1 && declare -F gateway_env_key_allowed >/dev/null 2>&1 && gateway_env_key_allowed "$1"; then
+    read_gateway_env_value "$GATEWAY_ENV_FILE" "$1" || true
+    return
+  fi
+  get_file_value "$GATEWAY_ENV_FILE" "$1"
+}
+
 load_gateway_env() {
   local saved
   saved="$(get_file_value "$GATEWAY_ENV_FILE" COMPOSE_PROJECT_NAME)"
   [ -z "$saved" ] || COMPOSE_PROJECT_NAME="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" LITELLM_HOST_IP)"
+  saved="$(get_gateway_value_safe LITELLM_HOST_IP)"
   [ -n "$LITELLM_HOST_IP" ] || LITELLM_HOST_IP="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" LITELLM_PORT)"
+  saved="$(get_gateway_value_safe LITELLM_PORT)"
   [ -n "$LITELLM_PORT" ] || LITELLM_PORT="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" TRUSTED_CLIENT_CIDR)"
+  saved="$(get_gateway_value_safe TRUSTED_CLIENT_CIDR)"
   [ -n "$TRUSTED_CLIENT_CIDR" ] || TRUSTED_CLIENT_CIDR="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" OLLAMA_BRIDGE_API_BASE)"
+  saved="$(get_gateway_value_safe OLLAMA_BRIDGE_API_BASE)"
+  PREVIOUS_OLLAMA_BRIDGE_API_BASE="$saved"
   [ -n "$OLLAMA_BRIDGE_API_BASE" ] || OLLAMA_BRIDGE_API_BASE="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" DOCKER_LITELLM_SUBNET)"
+  saved="$(get_gateway_value_safe DOCKER_LITELLM_SUBNET)"
   [ -n "$DOCKER_LITELLM_SUBNET" ] || DOCKER_LITELLM_SUBNET="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" OLLAMA_HOST_BIND)"
+  saved="$(get_gateway_value_safe OLLAMA_HOST_BIND)"
   [ -z "$saved" ] || OLLAMA_HOST_BIND="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" ZEROCLAW_HOST_IP)"
+  saved="$(get_gateway_value_safe ZEROCLAW_HOST_IP)"
   [ -n "$ZEROCLAW_HOST_IP" ] || ZEROCLAW_HOST_IP="$saved"
   saved="$(get_file_value "$GATEWAY_ENV_FILE" BIND_ADDR)"
   [ -n "$BIND_ADDR" ] || BIND_ADDR="$saved"
@@ -392,6 +404,97 @@ configure_ufw_for_docker_subnet() {
   ufw status verbose
 }
 
+rewrite_litellm_ollama_api_base_to_env() {
+  local tmp
+  local stamp
+  [ -f "$CONFIG_FILE" ] || {
+    warn "LiteLLM config not found: ${CONFIG_FILE}; skipping api_base rewrite."
+    return 1
+  }
+
+  tmp="$(mktemp)"
+  awk '
+    /^[[:space:]]*-[[:space:]]*model_name:/ { in_ollama=0 }
+    /^[[:space:]]*model:[[:space:]]*ollama\// { in_ollama=1; print; next }
+    in_ollama && /^[[:space:]]*api_base:/ {
+      print "      api_base: os.environ/OLLAMA_BRIDGE_API_BASE"
+      in_ollama=0
+      next
+    }
+    { print }
+  ' "$CONFIG_FILE" > "$tmp"
+
+  if cmp -s "$CONFIG_FILE" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak.${stamp}"
+  cat "$tmp" > "$CONFIG_FILE"
+  rm -f "$tmp"
+  chmod 0640 "$CONFIG_FILE"
+  log "Updated Ollama model api_base entries in ${CONFIG_FILE}; backup: ${CONFIG_FILE}.bak.${stamp}"
+  return 0
+}
+
+compose_litellm_up_recreate() {
+  [ -f "$COMPOSE_FILE" ] || {
+    warn "Compose file not found: ${COMPOSE_FILE}; cannot restart LiteLLM automatically."
+    return 1
+  }
+  (cd "$APP_DIR" && docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" up -d --force-recreate litellm)
+}
+
+wait_litellm_liveliness() {
+  local base="http://127.0.0.1:${LITELLM_PORT:-4000}"
+  local i
+  for i in $(seq 1 60); do
+    if curl -fsS "${base}/health/liveliness" >/dev/null 2>&1; then
+      log "LiteLLM liveliness endpoint is healthy."
+      return 0
+    fi
+    sleep 2
+  done
+  warn "Timed out waiting for ${base}/health/liveliness."
+  return 1
+}
+
+verify_litellm_models_after_bridge_update() {
+  local master_key
+  local base="http://127.0.0.1:${LITELLM_PORT:-4000}"
+  master_key="$(get_file_value "$ENV_FILE" LITELLM_MASTER_KEY)"
+  [ -n "$master_key" ] || {
+    warn "LITELLM_MASTER_KEY missing; cannot verify /v1/models."
+    return 1
+  }
+  curl -fsS "${base}/v1/models" -H "Authorization: Bearer ${master_key}" >/dev/null
+  log "Verified /v1/models with LITELLM_MASTER_KEY after bridge update."
+}
+
+apply_litellm_bridge_update_if_needed() {
+  local bridge_changed=0
+  local config_changed=0
+
+  if [ "$PREVIOUS_OLLAMA_BRIDGE_API_BASE" != "$OLLAMA_BRIDGE_API_BASE" ]; then
+    bridge_changed=1
+  fi
+
+  if rewrite_litellm_ollama_api_base_to_env; then
+    config_changed=1
+  fi
+
+  if [ "$bridge_changed" -eq 1 ] || [ "$config_changed" -eq 1 ]; then
+    save_gateway_env
+    compose_litellm_up_recreate || return 1
+    wait_litellm_liveliness || return 1
+    verify_litellm_models_after_bridge_update || return 1
+    printf '\nOLLAMA_BRIDGE_API_BASE changed; LiteLLM config updated and service restarted.\n'
+  else
+    save_gateway_env
+  fi
+}
+
 main() {
   parse_args "$@"
   require_root
@@ -414,7 +517,7 @@ main() {
   write_systemd_override
   verify_ollama_listen
   configure_ufw_for_docker_subnet
-  save_gateway_env
+  apply_litellm_bridge_update_if_needed
 
   cat <<EOF
 

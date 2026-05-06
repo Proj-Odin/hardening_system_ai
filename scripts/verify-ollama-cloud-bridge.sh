@@ -172,23 +172,31 @@ get_file_value() {
   printf '%s\n' "$value"
 }
 
+get_gateway_value_safe() {
+  if declare -F read_gateway_env_value >/dev/null 2>&1 && declare -F gateway_env_key_allowed >/dev/null 2>&1 && gateway_env_key_allowed "$1"; then
+    read_gateway_env_value "$GATEWAY_ENV_FILE" "$1" || true
+    return
+  fi
+  get_file_value "$GATEWAY_ENV_FILE" "$1"
+}
+
 load_env() {
   local saved
   saved="$(get_file_value "$GATEWAY_ENV_FILE" COMPOSE_PROJECT_NAME)"
   [ -z "$saved" ] || COMPOSE_PROJECT_NAME="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" LITELLM_HOST_IP)"
+  saved="$(get_gateway_value_safe LITELLM_HOST_IP)"
   [ -n "$LITELLM_HOST_IP" ] || LITELLM_HOST_IP="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" LITELLM_PORT)"
+  saved="$(get_gateway_value_safe LITELLM_PORT)"
   [ -n "$LITELLM_PORT" ] || LITELLM_PORT="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" TRUSTED_CLIENT_CIDR)"
+  saved="$(get_gateway_value_safe TRUSTED_CLIENT_CIDR)"
   [ -n "$TRUSTED_CLIENT_CIDR" ] || TRUSTED_CLIENT_CIDR="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" OLLAMA_BRIDGE_API_BASE)"
+  saved="$(get_gateway_value_safe OLLAMA_BRIDGE_API_BASE)"
   [ -n "$OLLAMA_BRIDGE_API_BASE" ] || OLLAMA_BRIDGE_API_BASE="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" DOCKER_LITELLM_SUBNET)"
+  saved="$(get_gateway_value_safe DOCKER_LITELLM_SUBNET)"
   [ -n "$DOCKER_LITELLM_SUBNET" ] || DOCKER_LITELLM_SUBNET="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" OLLAMA_HOST_BIND)"
+  saved="$(get_gateway_value_safe OLLAMA_HOST_BIND)"
   [ -z "$saved" ] || OLLAMA_HOST_BIND="$saved"
-  saved="$(get_file_value "$GATEWAY_ENV_FILE" ZEROCLAW_HOST_IP)"
+  saved="$(get_gateway_value_safe ZEROCLAW_HOST_IP)"
   [ -n "$ZEROCLAW_HOST_IP" ] || ZEROCLAW_HOST_IP="$saved"
   saved="$(get_file_value "$GATEWAY_ENV_FILE" BIND_ADDR)"
   [ -n "$BIND_ADDR" ] || BIND_ADDR="$saved"

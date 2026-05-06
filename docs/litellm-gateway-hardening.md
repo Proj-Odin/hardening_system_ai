@@ -123,6 +123,18 @@ sudo ./scripts/setup-litellm-gateway.sh \
 
 The setup script prompts for an optional `OPENROUTER_API_KEY`. Leave it blank unless you want the `openrouter-auto` route.
 
+Setup does not ask you to know Docker's bridge gateway before Docker exists. The flow is:
+
+1. Collect client-facing values such as `LITELLM_HOST_IP`, `LITELLM_PORT`, and `TRUSTED_CLIENT_CIDR`.
+2. Install and start Docker.
+3. Write the initial Compose file and start Postgres, which creates the Compose network.
+4. Detect the Compose network gateway and subnet.
+5. Prompt or accept detected `OLLAMA_BRIDGE_API_BASE` and `DOCKER_LITELLM_SUBNET`.
+6. Save those values to `gateway.env`.
+7. Generate final `config.yaml` and start the full stack.
+
+`gateway.env` is non-secret network config and is parsed safely by helper scripts. It is not sourced as shell code. `.env` remains the protected secret file and should stay root-owned with mode `600`; helpers that source it check those permissions first.
+
 ## Ollama Cloud Bridge
 
 Configure the host Ollama daemon:
@@ -167,7 +179,7 @@ Keep `11434` private. The listener can bind broadly, but firewall rules must res
 
 ## Models
 
-Generated `config.yaml` uses the selected `OLLAMA_BRIDGE_API_BASE` for:
+Generated `config.yaml` uses LiteLLM's `os.environ/OLLAMA_BRIDGE_API_BASE` reference for:
 
 - `ollama-gpt-oss-cloud`
 - `ollama-kimi-k26-cloud`
@@ -178,6 +190,17 @@ Generated `config.yaml` uses the selected `OLLAMA_BRIDGE_API_BASE` for:
 - `embed-nomic`
 - `embed-embeddinggemma`
 - `embed-qwen3`
+
+This keeps the active config from baking in a stale Docker gateway URL. The Compose file passes `gateway.env` into the LiteLLM container.
+
+If you change `OLLAMA_BRIDGE_API_BASE` after install, run:
+
+```sh
+sudo /opt/litellm-gateway/configure-ollama-cloud-bridge.sh \
+  --ollama-bridge-api-base <OLLAMA_BRIDGE_API_BASE>
+```
+
+The script updates `gateway.env`, rewrites older literal `api_base` entries to the env reference when needed, recreates/restarts the LiteLLM service so the updated env file is loaded, waits for `/health/liveliness`, and verifies `/v1/models` with `LITELLM_MASTER_KEY`.
 
 Chat cloud models are offloaded through Ollama Cloud. Embedding models are local Ollama models unless you explicitly configure a cloud embedding model.
 

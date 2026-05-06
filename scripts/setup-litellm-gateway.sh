@@ -435,6 +435,10 @@ get_env_value() {
 }
 
 get_gateway_value() {
+  if declare -F read_gateway_env_value >/dev/null 2>&1 && declare -F gateway_env_key_allowed >/dev/null 2>&1 && gateway_env_key_allowed "$1"; then
+    read_gateway_env_value "$GATEWAY_ENV_FILE" "$1" || true
+    return
+  fi
   get_file_value "$GATEWAY_ENV_FILE" "$1"
 }
 
@@ -558,15 +562,19 @@ prompt_value() {
   printf -v "$var_name" '%s' "$entered"
 }
 
-collect_network_settings() {
+collect_client_network_settings() {
   local detected_ip
-  local detected_gateway
-  local detected_subnet
 
   detected_ip="$(detect_primary_ip)"
   prompt_value LITELLM_HOST_IP "Enter LiteLLM gateway LAN/Tailscale IP clients should use" "$detected_ip" required
   prompt_value LITELLM_PORT "Enter LiteLLM host port clients should use" "4000" required
   prompt_value TRUSTED_CLIENT_CIDR "Enter trusted client CIDR allowed to access LiteLLM port ${LITELLM_PORT}" "" required
+  prompt_value ZEROCLAW_HOST_IP "Enter ZeroClaw host IP or leave blank to skip ZeroClaw-specific tests" "" optional
+}
+
+collect_docker_bridge_settings() {
+  local detected_gateway
+  local detected_subnet
 
   detected_gateway="$(detect_docker_gateway)"
   if [ -z "$OLLAMA_BRIDGE_API_BASE" ] && [ -n "$detected_gateway" ]; then
@@ -579,8 +587,6 @@ collect_network_settings() {
     DOCKER_LITELLM_SUBNET="$detected_subnet"
   fi
   prompt_value DOCKER_LITELLM_SUBNET "Enter Docker subnet allowed to reach the host Ollama daemon" "$DOCKER_LITELLM_SUBNET" required
-
-  prompt_value ZEROCLAW_HOST_IP "Enter ZeroClaw host IP or leave blank to skip ZeroClaw-specific tests" "" optional
 }
 
 secret_or_generate() {
@@ -727,51 +733,51 @@ model_list:
   - model_name: ollama-gpt-oss-cloud
     litellm_params:
       model: ollama/gpt-oss:120b-cloud
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
 
   - model_name: ollama-kimi-k26-cloud
     litellm_params:
       model: ollama/kimi-k2.6:cloud
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
 
   - model_name: ollama-glm-51-cloud
     litellm_params:
       model: ollama/glm-5.1:cloud
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
 
   - model_name: ollama-deepseek-v4-pro-cloud
     litellm_params:
       model: ollama/deepseek-v4-pro:cloud
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
 
   - model_name: ollama-gemma4-31b-cloud
     litellm_params:
       model: ollama/gemma4:31b-cloud
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
 
   - model_name: ollama-nemotron-3-super-cloud
     litellm_params:
       model: ollama/nemotron-3-super:cloud
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
 
   - model_name: embed-nomic
     litellm_params:
       model: ollama/nomic-embed-text
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
     model_info:
       mode: embedding
 
   - model_name: embed-embeddinggemma
     litellm_params:
       model: ollama/embeddinggemma
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
     model_info:
       mode: embedding
 
   - model_name: embed-qwen3
     litellm_params:
       model: ollama/qwen3-embedding
-      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+      api_base: os.environ/OLLAMA_BRIDGE_API_BASE
     model_info:
       mode: embedding
 EOF
@@ -1054,6 +1060,11 @@ start_gateway() {
   (cd "$APP_DIR" && docker compose -p "$COMPOSE_PROJECT_NAME" up -d)
 }
 
+ensure_compose_network_exists() {
+  log "Creating Compose project network before detecting Docker gateway/subnet"
+  (cd "$APP_DIR" && docker compose -p "$COMPOSE_PROJECT_NAME" up -d postgres)
+}
+
 refresh_detected_docker_network_settings() {
   local detected_gateway
   local detected_subnet
@@ -1119,7 +1130,7 @@ main() {
   fi
   detect_os
   apply_existing_settings
-  collect_network_settings
+  collect_client_network_settings
   ensure_litellm_ghcr_image "$LITELLM_IMAGE"
   refuse_bad_image_tag "$LITELLM_IMAGE"
   refuse_bad_image_tag "$POSTGRES_IMAGE"
@@ -1134,18 +1145,21 @@ main() {
     sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
   fi
   write_gateway_env_file
-  write_litellm_config
 
   local litellm_digest
   local postgres_digest
   litellm_digest="$(pull_and_resolve_digest "$LITELLM_IMAGE")"
   cosign_verify_image "$LITELLM_IMAGE"
   cosign_verify_image "$litellm_digest"
-  align_config_permissions_for_image "$litellm_digest"
   postgres_digest="$(pull_and_resolve_digest "$POSTGRES_IMAGE")"
 
-  validate_config_with_container "$litellm_digest"
   write_compose_file "$litellm_digest" "$postgres_digest"
+  ensure_compose_network_exists
+  collect_docker_bridge_settings
+  write_gateway_env_file
+  write_litellm_config
+  align_config_permissions_for_image "$litellm_digest"
+  validate_config_with_container "$litellm_digest"
   write_egress_allowlist
   configure_ufw
   write_docker_user_rules

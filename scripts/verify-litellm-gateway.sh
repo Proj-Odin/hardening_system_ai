@@ -167,6 +167,10 @@ get_env_value() {
 }
 
 get_gateway_value() {
+  if declare -F read_gateway_env_value >/dev/null 2>&1 && declare -F gateway_env_key_allowed >/dev/null 2>&1 && gateway_env_key_allowed "$1"; then
+    read_gateway_env_value "$GATEWAY_ENV_FILE" "$1" || true
+    return
+  fi
   get_file_value "$GATEWAY_ENV_FILE" "$1"
 }
 

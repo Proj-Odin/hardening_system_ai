@@ -187,3 +187,5 @@ zeroclaw to litellm ok
 ## Optional Targeted Test
 
 If you save `ZEROCLAW_HOST_IP` in `/opt/litellm-gateway/gateway.env`, use it only for targeted firewall or reachability checks. The general configuration should still rely on `<LITELLM_HOST_IP>`, `<LITELLM_PORT>`, and a scoped LiteLLM virtual key.
+
+`gateway.env` is non-secret gateway network config. Helper scripts parse it as data and do not source it as shell code. The protected `.env` file remains the secret store for LiteLLM and database credentials.

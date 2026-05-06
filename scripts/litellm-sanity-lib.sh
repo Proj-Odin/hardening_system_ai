@@ -51,6 +51,94 @@ sanity_file_value() {
   printf '%s\n' "$value"
 }
 
+gateway_env_key_allowed() {
+  case "$1" in
+    LITELLM_HOST_IP|LITELLM_PORT|TRUSTED_CLIENT_CIDR|OLLAMA_BRIDGE_API_BASE|DOCKER_LITELLM_SUBNET|OLLAMA_HOST_BIND|ZEROCLAW_HOST_IP)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+gateway_env_value_safe() {
+  local value="$1"
+  [ -z "$value" ] && return 0
+  if printf '%s' "$value" | grep -Eq '[;&|`$()<>]'; then
+    return 1
+  fi
+  if printf '%s' "$value" | grep -Eq '[[:cntrl:]]'; then
+    return 1
+  fi
+  return 0
+}
+
+read_gateway_env_value() {
+  local file="$1"
+  local key="$2"
+  local value
+
+  [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || {
+    sanity_warn "Rejected invalid gateway.env key name: ${key}"
+    return 1
+  }
+  gateway_env_key_allowed "$key" || {
+    sanity_warn "Ignoring unsupported gateway.env key request: ${key}"
+    return 1
+  }
+
+  value="$(sanity_file_value "$file" "$key")"
+  if ! gateway_env_value_safe "$value"; then
+    sanity_warn "Rejected unsafe value for ${key} in ${file}; refusing to use it."
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+load_gateway_env_safe() {
+  local file="$1"
+  local line
+  local key
+  local value
+  [ -f "$file" ] || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ""|\#*) continue ;;
+      *=*) ;;
+      *)
+        sanity_warn "Ignoring malformed gateway.env line without KEY=VALUE."
+        continue
+        ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$value" in
+      \"*\") value="${value#\"}"; value="${value%\"}" ;;
+      \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || {
+      sanity_warn "Rejected invalid gateway.env key name: ${key:-<empty>}"
+      continue
+    }
+    gateway_env_key_allowed "$key" || {
+      sanity_warn "Ignoring unsupported gateway.env key: ${key}"
+      continue
+    }
+    if ! gateway_env_value_safe "$value"; then
+      sanity_warn "Rejected unsafe value for ${key} in ${file}; refusing to use it."
+      continue
+    fi
+    printf -v "$key" '%s' "$value"
+  done < "$file"
+}
+
 sanity_os_name() {
   if [ -r /etc/os-release ]; then
     (

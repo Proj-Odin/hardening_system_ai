@@ -131,7 +131,13 @@ parse_args() {
 
 source_env_file() {
   local file="$1"
+  local owner_uid
+  local mode
   [ -f "$file" ] || return 0
+  owner_uid="$(stat -c '%u' "$file" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
+  [ "$owner_uid" = "0" ] || die "${file} must be root-owned before it is sourced."
+  [ "$mode" = "600" ] || die "${file} must be chmod 600 before it is sourced."
   # shellcheck disable=SC1090
   set -a
   . "$file"
@@ -139,24 +145,8 @@ source_env_file() {
 }
 
 load_gateway_env_file() {
-  local value
-  declare -F sanity_file_value >/dev/null 2>&1 || return 0
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" LITELLM_HOST_IP)"
-  [ -n "$LITELLM_HOST_IP" ] || LITELLM_HOST_IP="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" LITELLM_PORT)"
-  [ -n "$LITELLM_PORT" ] || LITELLM_PORT="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" TRUSTED_CLIENT_CIDR)"
-  [ -n "$TRUSTED_CLIENT_CIDR" ] || TRUSTED_CLIENT_CIDR="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" OLLAMA_BRIDGE_API_BASE)"
-  [ -n "$OLLAMA_BRIDGE_API_BASE" ] || OLLAMA_BRIDGE_API_BASE="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" DOCKER_LITELLM_SUBNET)"
-  [ -n "$DOCKER_LITELLM_SUBNET" ] || DOCKER_LITELLM_SUBNET="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" OLLAMA_HOST_BIND)"
-  [ "$OLLAMA_HOST_BIND" = "0.0.0.0:11434" ] && [ -n "$value" ] && OLLAMA_HOST_BIND="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" ZEROCLAW_HOST_IP)"
-  [ -n "$ZEROCLAW_HOST_IP" ] || ZEROCLAW_HOST_IP="$value"
-  value="$(sanity_file_value "$GATEWAY_ENV_FILE" COMPOSE_PROJECT_NAME)"
-  [ "$COMPOSE_PROJECT_NAME" = "litellm-gateway" ] && [ -n "$value" ] && COMPOSE_PROJECT_NAME="$value"
+  declare -F load_gateway_env_safe >/dev/null 2>&1 || return 0
+  load_gateway_env_safe "$GATEWAY_ENV_FILE"
 }
 
 detect_primary_ip() {
