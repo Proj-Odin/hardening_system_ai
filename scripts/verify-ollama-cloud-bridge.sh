@@ -22,6 +22,8 @@ DIRECT_OLLAMA_CHAT_MODEL="${DIRECT_OLLAMA_CHAT_MODEL:-gpt-oss:120b-cloud}"
 LITELLM_CHAT_MODEL="${LITELLM_CHAT_MODEL:-ollama-kimi-k26-cloud}"
 LITELLM_EMBEDDING_MODEL="${LITELLM_EMBEDDING_MODEL:-embed-nomic}"
 YES=0
+INTERACTIVE=0
+REPAIR_DATABASE_URL=0
 FAILURES=0
 
 pass_check() {
@@ -42,6 +44,14 @@ die() {
   exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
+  # shellcheck disable=SC1091
+  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
+else
+  warn_check "litellm-sanity-lib.sh not found; account sanity checks will be limited."
+fi
+
 usage() {
   cat <<'EOF'
 Usage: verify-ollama-cloud-bridge.sh [options]
@@ -57,6 +67,8 @@ Options:
   --direct-ollama-model MODEL     Direct Ollama /api/chat model. Default: gpt-oss:120b-cloud.
   --litellm-chat-model MODEL      LiteLLM chat model. Default: ollama-kimi-k26-cloud.
   --litellm-embedding-model MODEL LiteLLM embedding model. Default: embed-nomic.
+  --interactive                   Run interactive Ollama cloud smoke command.
+  --repair-database-url           Rewrite DATABASE_URL from POSTGRES_PASSWORD if they differ.
   --yes                           Accept detected/default non-secret network values.
   -h, --help                      Show this help.
 EOF
@@ -70,6 +82,8 @@ parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --yes) YES=1 ;;
+      --interactive) INTERACTIVE=1 ;;
+      --repair-database-url) REPAIR_DATABASE_URL=1 ;;
       --litellm-host-ip)
         shift
         [ "$#" -gt 0 ] || die_arg "--litellm-host-ip"
@@ -185,6 +199,7 @@ load_env() {
   saved="$(get_file_value "$GATEWAY_ENV_FILE" LITELLM_READ_ONLY)"
   [ -n "$LITELLM_READ_ONLY" ] || LITELLM_READ_ONLY="$saved"
   LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-$(get_file_value "$ENV_FILE" LITELLM_MASTER_KEY)}"
+  OLLAMA_API_KEY="${OLLAMA_API_KEY:-$(get_file_value "$ENV_FILE" OLLAMA_API_KEY)}"
 }
 
 detect_primary_ip() {
@@ -328,6 +343,59 @@ http_test() {
   report_http_result "$label" "$status" "$response_body" "$curl_error"
 }
 
+test_ollama_cloud_api_key_access() {
+  local response_file
+  local error_file
+  local catalog_status
+  local inference_status
+  local catalog_body
+  local inference_body
+  local curl_error
+  local payload
+
+  printf '\nOllama Cloud API key distinction tests:\n'
+  if [ -z "${OLLAMA_API_KEY:-}" ]; then
+    warn_check "OLLAMA_API_KEY is missing; skipping direct Ollama Cloud catalog and OpenAI-compatible inference tests."
+    return
+  fi
+  printf '  OLLAMA_API_KEY=SET length=%s prefix=<set>\n' "${#OLLAMA_API_KEY}"
+
+  response_file="$(mktemp)"
+  error_file="$(mktemp)"
+  catalog_status="$(curl_capture GET "https://ollama.com/api/tags" "" "$response_file" "$error_file" -H "Authorization: Bearer ${OLLAMA_API_KEY}")"
+  catalog_body="$(cat "$response_file" 2>/dev/null || true)"
+  curl_error="$(cat "$error_file" 2>/dev/null || true)"
+  if [[ "$catalog_status" =~ ^2[0-9][0-9]$ ]]; then
+    pass_check "Ollama Cloud model catalog request succeeded with OLLAMA_API_KEY"
+  else
+    report_http_result "Ollama Cloud model catalog request" "$catalog_status" "$catalog_body" "$curl_error"
+  fi
+
+  payload="$(jq -n --arg model "$DIRECT_OLLAMA_CHAT_MODEL" '{
+    model: $model,
+    messages: [{role: "user", content: "Reply with only: ollama cloud api ok"}],
+    max_tokens: 20,
+    temperature: 0
+  }')"
+  : > "$response_file"
+  : > "$error_file"
+  inference_status="$(curl_capture POST "https://ollama.com/v1/chat/completions" "$payload" "$response_file" "$error_file" \
+    -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
+    -H "Content-Type: application/json")"
+  inference_body="$(cat "$response_file" 2>/dev/null || true)"
+  curl_error="$(cat "$error_file" 2>/dev/null || true)"
+  rm -f "$response_file" "$error_file"
+
+  if [[ "$inference_status" =~ ^2[0-9][0-9]$ ]]; then
+    pass_check "Direct Ollama Cloud OpenAI-compatible inference succeeded"
+  else
+    report_http_result "Direct Ollama Cloud OpenAI-compatible inference" "$inference_status" "$inference_body" "$curl_error"
+    if [[ "$catalog_status" =~ ^2[0-9][0-9]$ ]] && [ "$inference_status" = "401" ]; then
+      warn_check "Catalog access works, but inference is unauthorized. Check account, subscription/entitlement, model name, or endpoint."
+    fi
+  fi
+}
+
 test_host_local_ollama() {
   http_test "Host can reach Ollama on loopback" GET "http://127.0.0.1:11434/api/tags"
 }
@@ -348,12 +416,26 @@ test_container_to_ollama() {
 
 test_direct_ollama_cloud_chat() {
   local payload
+  local response_file
+  local error_file
+  local status
+  local body
+  local curl_error
   payload="$(jq -n --arg model "$DIRECT_OLLAMA_CHAT_MODEL" '{
     model: $model,
     stream: false,
     messages: [{role: "user", content: "Say exactly: ollama local bridge test ok"}]
   }')"
-  http_test "Direct local Ollama cloud model chat" POST "http://127.0.0.1:11434/api/chat" "$payload" -H "Content-Type: application/json"
+  response_file="$(mktemp)"
+  error_file="$(mktemp)"
+  status="$(curl_capture POST "http://127.0.0.1:11434/api/chat" "$payload" "$response_file" "$error_file" -H "Content-Type: application/json")"
+  body="$(cat "$response_file" 2>/dev/null || true)"
+  curl_error="$(cat "$error_file" 2>/dev/null || true)"
+  rm -f "$response_file" "$error_file"
+  report_http_result "Direct local Ollama cloud model chat" "$status" "$body" "$curl_error"
+  if [ "$status" = "401" ]; then
+    warn_check "CLI user may be authenticated, but Ollama service user likely is not. Add the service user's public key to https://ollama.com/settings/keys."
+  fi
 }
 
 test_litellm_chat() {
@@ -392,12 +474,23 @@ main() {
   parse_args "$@"
   load_env
   collect_settings
+  if declare -F sanity_host_banner >/dev/null 2>&1; then
+    sanity_host_banner "LiteLLM gateway/Ollama bridge verification host" "$APP_DIR" "${APP_DIR}/docker-compose.yml"
+    sanity_ollama_identity_check
+    sanity_env_report "$ENV_FILE"
+    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
+    sanity_docker_service_check
+    sanity_compose_running_check "$APP_DIR" "$COMPOSE_PROJECT_NAME" "${APP_DIR}/docker-compose.yml"
+    sanity_ollama_api_key_note
+    sanity_ollama_account_checklist "$INTERACTIVE"
+  fi
   command -v curl >/dev/null 2>&1 || fail_check "curl is required"
   command -v docker >/dev/null 2>&1 || fail_check "docker is required"
   command -v jq >/dev/null 2>&1 || fail_check "jq is required"
   [ "$FAILURES" -eq 0 ] || exit 1
   save_gateway_env
 
+  test_ollama_cloud_api_key_access
   test_host_local_ollama
   test_host_gateway_ollama
   test_container_to_ollama

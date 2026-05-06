@@ -38,6 +38,7 @@ FORCE=0
 SKIP_COSIGN=0
 STRICT_EGRESS=0
 YES=0
+REPAIR_DATABASE_URL=0
 OPENROUTER_CONFIGURED=0
 LOGFILE=""
 
@@ -71,6 +72,14 @@ die() {
   exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
+  # shellcheck disable=SC1091
+  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
+else
+  warn "litellm-sanity-lib.sh not found; account sanity checks will be limited."
+fi
+
 usage() {
   cat <<'EOF'
 Usage: setup-litellm-gateway.sh [options]
@@ -90,6 +99,7 @@ Options:
   --docker-litellm-subnet CIDR    Docker subnet allowed to reach host Ollama.
   --ollama-host-bind HOST:PORT    Ollama service bind. Default: 0.0.0.0:11434.
   --zeroclaw-host-ip IP           Optional ZeroClaw host IP for saved examples/tests.
+  --repair-database-url           Rewrite DATABASE_URL from POSTGRES_PASSWORD if they differ.
   --yes                           Accept detected/default non-secret network values.
   -h, --help                      Show this help.
 
@@ -105,6 +115,7 @@ parse_args() {
       --skip-cosign) SKIP_COSIGN=1 ;;
       --strict-egress) STRICT_EGRESS=1 ;;
       --yes) YES=1 ;;
+      --repair-database-url) REPAIR_DATABASE_URL=1 ;;
       --image)
         shift
         [ "$#" -gt 0 ] || die "--image requires a value"
@@ -1088,7 +1099,8 @@ copy_helper_scripts() {
     backup-litellm-gateway.sh \
     configure-ollama-cloud-bridge.sh \
     verify-ollama-cloud-bridge.sh \
-    create-litellm-client-key.sh; do
+    create-litellm-client-key.sh \
+    litellm-sanity-lib.sh; do
     if [ -f "${repo_script_dir}/${helper}" ]; then
       install -m 0750 -o root -g litellm-gateway "${repo_script_dir}/${helper}" "${APP_DIR}/${helper}"
     fi
@@ -1099,6 +1111,12 @@ main() {
   parse_args "$@"
   require_root
   setup_logging
+  if declare -F sanity_host_banner >/dev/null 2>&1; then
+    sanity_host_banner "LiteLLM setup host" "$APP_DIR" "$COMPOSE_FILE"
+    sanity_ollama_identity_check
+    sanity_env_report "$ENV_FILE"
+    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
+  fi
   detect_os
   apply_existing_settings
   collect_network_settings
@@ -1111,6 +1129,10 @@ main() {
   ensure_layout
   copy_helper_scripts
   write_secret_env_file
+  if declare -F sanity_env_report >/dev/null 2>&1; then
+    sanity_env_report "$ENV_FILE"
+    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
+  fi
   write_gateway_env_file
   write_litellm_config
 
@@ -1129,6 +1151,11 @@ main() {
   write_docker_user_rules
   start_gateway
   refresh_detected_docker_network_settings
+  if declare -F sanity_docker_service_check >/dev/null 2>&1; then
+    sanity_docker_service_check
+    sanity_compose_running_check "$APP_DIR" "$COMPOSE_PROJECT_NAME" "$COMPOSE_FILE"
+    sanity_firewall_access_check "$LITELLM_PORT" "$TRUSTED_CLIENT_CIDR"
+  fi
 
   "${APP_DIR}/verify-litellm-gateway.sh" || warn "Verification reported issues. Review output before using the gateway."
   print_next_steps

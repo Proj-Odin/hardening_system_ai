@@ -4,6 +4,7 @@ IFS=$'\n\t'
 umask 077
 
 APP_DIR="${APP_DIR:-/opt/litellm-gateway}"
+ENV_FILE="${APP_DIR}/.env"
 GATEWAY_ENV_FILE="${APP_DIR}/gateway.env"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-litellm-gateway}"
 LITELLM_HOST_IP="${LITELLM_HOST_IP:-}"
@@ -19,6 +20,8 @@ POSTGRES_IMAGE="${POSTGRES_IMAGE:-}"
 LITELLM_READ_ONLY="${LITELLM_READ_ONLY:-}"
 INSTALL_OLLAMA=0
 COPY_ADMIN_KEY=0
+INTERACTIVE=0
+REPAIR_DATABASE_URL=0
 YES=0
 
 log() {
@@ -34,6 +37,14 @@ die() {
   exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
+  # shellcheck disable=SC1091
+  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
+else
+  warn "litellm-sanity-lib.sh not found; account sanity checks will be limited."
+fi
+
 usage() {
   cat <<'EOF'
 Usage: configure-ollama-cloud-bridge.sh [options]
@@ -41,6 +52,7 @@ Usage: configure-ollama-cloud-bridge.sh [options]
 Options:
   --install-ollama                Install Ollama if missing. Explicit opt-in only.
   --copy-admin-key                Emergency/manual: copy admin Ollama key into service user.
+  --interactive                   Run interactive Ollama cloud smoke command.
   --litellm-host-ip IP            LAN/Tailscale IP clients should use for LiteLLM.
   --litellm-port PORT             Host LiteLLM port. Default prompt value: 4000.
   --trusted-client-cidr CIDR      CIDR or single-client /32 allowed to reach LiteLLM.
@@ -48,6 +60,7 @@ Options:
   --docker-litellm-subnet CIDR    Docker subnet allowed to reach host Ollama.
   --ollama-host-bind HOST:PORT    Ollama service bind. Default: 0.0.0.0:11434.
   --zeroclaw-host-ip IP           Optional ZeroClaw host IP for saved examples/tests.
+  --repair-database-url           Rewrite DATABASE_URL from POSTGRES_PASSWORD if they differ.
   --yes                           Apply firewall/key-copy confirmations non-interactively.
   -h, --help                      Show this help.
 EOF
@@ -62,7 +75,9 @@ parse_args() {
     case "$1" in
       --install-ollama) INSTALL_OLLAMA=1 ;;
       --copy-admin-key) COPY_ADMIN_KEY=1 ;;
+      --interactive) INTERACTIVE=1 ;;
       --yes) YES=1 ;;
+      --repair-database-url) REPAIR_DATABASE_URL=1 ;;
       --litellm-host-ip)
         shift
         [ "$#" -gt 0 ] || die_arg "--litellm-host-ip"
@@ -382,6 +397,17 @@ main() {
   require_root
   load_gateway_env
   collect_network_settings
+  if declare -F sanity_host_banner >/dev/null 2>&1; then
+    sanity_host_banner "LiteLLM gateway/Ollama bridge host" "$APP_DIR" "${APP_DIR}/docker-compose.yml"
+    sanity_ollama_identity_check
+    sanity_env_report "$ENV_FILE"
+    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
+    sanity_docker_service_check
+    sanity_compose_running_check "$APP_DIR" "$COMPOSE_PROJECT_NAME" "${APP_DIR}/docker-compose.yml"
+    sanity_firewall_access_check "${LITELLM_PORT:-4000}" "$TRUSTED_CLIENT_CIDR"
+    sanity_ollama_api_key_note
+    sanity_ollama_account_checklist "$INTERACTIVE"
+  fi
   install_ollama_if_requested
   show_ollama_identity
   copy_admin_key_if_requested
