@@ -21,7 +21,6 @@ LITELLM_READ_ONLY="${LITELLM_READ_ONLY:-}"
 VERIFY_CHAT_MODEL="${VERIFY_CHAT_MODEL:-}"
 SKIP_PROVIDER_TEST="${SKIP_PROVIDER_TEST:-0}"
 YES=0
-REPAIR_DATABASE_URL=0
 FAILURES=0
 
 on_error() {
@@ -46,14 +45,6 @@ warn_check() {
   printf '[WARN] %s\n' "$*" >&2
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
-  # shellcheck disable=SC1091
-  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
-else
-  warn_check "litellm-sanity-lib.sh not found; account sanity checks will be limited."
-fi
-
 usage() {
   cat <<'EOF'
 Usage: verify-litellm-gateway.sh [options]
@@ -67,7 +58,6 @@ Options:
   --zeroclaw-host-ip IP           Optional ZeroClaw host IP for saved examples/tests.
   --chat-model MODEL              Chat model smoke test target.
   --skip-provider-test            Skip routed chat completion smoke test.
-  --repair-database-url           Rewrite DATABASE_URL from POSTGRES_PASSWORD if they differ.
   --yes                           Accept detected/default non-secret network values.
   -h, --help                      Show this help.
 EOF
@@ -114,9 +104,6 @@ parse_args() {
         ;;
       --skip-provider-test)
         SKIP_PROVIDER_TEST=1
-        ;;
-      --repair-database-url)
-        REPAIR_DATABASE_URL=1
         ;;
       -h|--help)
         usage
@@ -167,10 +154,6 @@ get_env_value() {
 }
 
 get_gateway_value() {
-  if declare -F read_gateway_env_value >/dev/null 2>&1 && declare -F gateway_env_key_allowed >/dev/null 2>&1 && gateway_env_key_allowed "$1"; then
-    read_gateway_env_value "$GATEWAY_ENV_FILE" "$1" || true
-    return
-  fi
   get_file_value "$GATEWAY_ENV_FILE" "$1"
 }
 
@@ -236,7 +219,6 @@ load_settings() {
   COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${env_project:-litellm-gateway}}"
 
   LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-$(get_env_value LITELLM_MASTER_KEY)}"
-  LITELLM_CLIENT_KEY="${LITELLM_CLIENT_KEY:-$(get_env_value LITELLM_CLIENT_KEY)}"
   LITELLM_HOST_IP="${LITELLM_HOST_IP:-$(get_gateway_value LITELLM_HOST_IP)}"
   LITELLM_PORT="${LITELLM_PORT:-$(get_gateway_value LITELLM_PORT)}"
   [ -n "$LITELLM_PORT" ] || LITELLM_PORT="$(get_env_value LITELLM_PORT)"
@@ -521,31 +503,6 @@ check_http() {
     classify_litellm_failure "$http_status" "$models_body" "$curl_error"
   fi
 
-  if declare -F sanity_client_key_summary >/dev/null 2>&1 && sanity_client_key_summary; then
-    local client_models_body
-    local master_count
-    local client_count
-    : > "$response_file"
-    : > "$error_file"
-    http_status="$(curl_capture GET "${base}/v1/models" "" "$response_file" "$error_file" -H "Authorization: Bearer ${LITELLM_CLIENT_KEY}")"
-    client_models_body="$(cat "$response_file" 2>/dev/null || true)"
-    curl_error="$(cat "$error_file" 2>/dev/null || true)"
-    if [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
-      pass_check "/v1/models responded with LITELLM_CLIENT_KEY"
-      master_count="$(printf '%s' "$models_body" | jq -r '.data | length' 2>/dev/null || true)"
-      client_count="$(printf '%s' "$client_models_body" | jq -r '.data | length' 2>/dev/null || true)"
-      if [[ "$master_count" =~ ^[0-9]+$ ]] && [[ "$client_count" =~ ^[0-9]+$ ]] && [ "$client_count" -lt "$master_count" ]; then
-        warn_check "Client key sees fewer models than the master key. This is expected if the virtual key is scoped."
-      fi
-      if ! printf '%s' "$client_models_body" | grep -q 'openrouter-auto'; then
-        warn_check "openrouter-auto is missing from the client key model list. Expected if the client key intentionally excludes OpenRouter."
-      fi
-    else
-      print_http_failure "/v1/models with LITELLM_CLIENT_KEY" "$http_status" "$client_models_body" "$curl_error"
-      classify_litellm_failure "$http_status" "$client_models_body" "$curl_error"
-    fi
-  fi
-
   if [ "$SKIP_PROVIDER_TEST" = "1" ]; then
     warn_check "Skipping routed chat completion test because SKIP_PROVIDER_TEST=1 or --skip-provider-test was used"
     rm -f "$response_file" "$error_file"
@@ -595,15 +552,6 @@ print_endpoint() {
 main() {
   parse_args "$@"
   load_settings
-  if declare -F sanity_host_banner >/dev/null 2>&1; then
-    sanity_host_banner "LiteLLM gateway verification host" "$APP_DIR" "$COMPOSE_FILE"
-    sanity_ollama_identity_check
-    sanity_env_report "$ENV_FILE"
-    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
-    sanity_docker_service_check
-    sanity_compose_running_check "$APP_DIR" "$COMPOSE_PROJECT_NAME" "$COMPOSE_FILE"
-    sanity_firewall_access_check "${LITELLM_PORT:-4000}" "$TRUSTED_CLIENT_CIDR"
-  fi
   save_gateway_env
   command -v docker >/dev/null 2>&1 || fail_check "docker is not installed"
   command -v jq >/dev/null 2>&1 || fail_check "jq is required for JSON request generation"

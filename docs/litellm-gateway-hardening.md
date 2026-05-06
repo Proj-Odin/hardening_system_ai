@@ -123,18 +123,6 @@ sudo ./scripts/setup-litellm-gateway.sh \
 
 The setup script prompts for an optional `OPENROUTER_API_KEY`. Leave it blank unless you want the `openrouter-auto` route.
 
-Setup does not ask you to know Docker's bridge gateway before Docker exists. The flow is:
-
-1. Collect client-facing values such as `LITELLM_HOST_IP`, `LITELLM_PORT`, and `TRUSTED_CLIENT_CIDR`.
-2. Install and start Docker.
-3. Write the initial Compose file and start Postgres, which creates the Compose network.
-4. Detect the Compose network gateway and subnet.
-5. Prompt or accept detected `OLLAMA_BRIDGE_API_BASE` and `DOCKER_LITELLM_SUBNET`.
-6. Save those values to `gateway.env`.
-7. Generate final `config.yaml` and start the full stack.
-
-`gateway.env` is non-secret network config and is parsed safely by helper scripts. It is not sourced as shell code. `.env` remains the protected secret file and should stay root-owned with mode `600`; helpers that source it check those permissions first.
-
 ## Ollama Cloud Bridge
 
 Configure the host Ollama daemon:
@@ -179,7 +167,7 @@ Keep `11434` private. The listener can bind broadly, but firewall rules must res
 
 ## Models
 
-Generated `config.yaml` uses LiteLLM's `os.environ/OLLAMA_BRIDGE_API_BASE` reference for:
+Generated `config.yaml` uses the selected `OLLAMA_BRIDGE_API_BASE` for:
 
 - `ollama-gpt-oss-cloud`
 - `ollama-kimi-k26-cloud`
@@ -190,17 +178,6 @@ Generated `config.yaml` uses LiteLLM's `os.environ/OLLAMA_BRIDGE_API_BASE` refer
 - `embed-nomic`
 - `embed-embeddinggemma`
 - `embed-qwen3`
-
-This keeps the active config from baking in a stale Docker gateway URL. The Compose file passes `gateway.env` into the LiteLLM container.
-
-If you change `OLLAMA_BRIDGE_API_BASE` after install, run:
-
-```sh
-sudo /opt/litellm-gateway/configure-ollama-cloud-bridge.sh \
-  --ollama-bridge-api-base <OLLAMA_BRIDGE_API_BASE>
-```
-
-The script updates `gateway.env`, rewrites older literal `api_base` entries to the env reference when needed, recreates/restarts the LiteLLM service so the updated env file is loaded, waits for `/health/liveliness`, and verifies `/v1/models` with `LITELLM_MASTER_KEY`.
 
 Chat cloud models are offloaded through Ollama Cloud. Embedding models are local Ollama models unless you explicitly configure a cloud embedding model.
 
@@ -261,183 +238,7 @@ By default the key includes:
 
 It excludes `openrouter-auto` unless `--include-openrouter` is passed.
 
-The response field named `key` is the client API key. `token_id` is not the API key. The helper stores the full response in a protected file and prints key length/prefix only.
-
-## Before Blaming The Software
-
-Run this checklist before debugging LiteLLM, Ollama, ZeroClaw, or firewall behavior:
-
-- Am I on the right VM?
-- Am I the right Linux user?
-- Is Docker running?
-- Is LiteLLM running?
-- Is the client using the virtual key, not `token_id`?
-- Did I source/export the key in this shell?
-- Is the key length non-zero?
-- Is the Ollama daemon service user authorized, not just my admin user?
-- Did I add the service user's public key to `https://ollama.com/settings/keys`?
-- Is the model local, cloud, or routed through LiteLLM?
-- Am I using the correct endpoint?
-- LiteLLM clients use `/v1`.
-- Local Ollama daemon calls use `/api/chat`, `/api/generate`, or `/api/embed`.
-- Direct Ollama Cloud OpenAI-compatible calls use `/v1`.
-- Did I restart LiteLLM after editing `config.yaml`?
-- Did I snapshot with the service actually running?
-
-The scripts print an "Account and credential sanity checks" section to make these mistakes obvious early.
-
-## Account And Credential Sanity Checks
-
-Linux identities matter:
-
-- `admin` or `root` installs packages and manages services.
-- `zeroclaw` runs ZeroClaw.
-- `ollama` runs the Ollama daemon.
-- The LiteLLM container runs as a non-root user such as `nobody`.
-
-Useful identity commands:
-
-```sh
-whoami
-id
-hostname
-ps -eo user,pid,cmd | grep '[o]llama'
-getent passwd ollama
-```
-
-If the Ollama daemon runs as `ollama`, signing in as your admin user does not automatically authenticate the daemon.
-
-Compare current-user and service-user Ollama public key fingerprints:
-
-```sh
-ssh-keygen -lf ~/.ollama/id_ed25519.pub
-sudo -u ollama ssh-keygen -lf /usr/share/ollama/.ollama/id_ed25519.pub
-```
-
-If they differ, they are different Ollama identities. The CLI may work while the local API daemon returns unauthorized for cloud models.
-
-Never print or copy private key contents. Prefer adding the service user's public key to `https://ollama.com/settings/keys`.
-
-## Ollama Auth Sanity
-
-`OLLAMA_API_KEY`, `ollama signin`, and the service user's SSH identity are different things:
-
-- `OLLAMA_API_KEY` is for programmatic cloud API access.
-- Ollama CLI cloud use may rely on `ollama signin` and local SSH identity files.
-- Local Ollama daemon cloud access uses the `ollama` service user's identity, not necessarily the admin user's `OLLAMA_API_KEY`.
-- `/api/tags` success does not prove `/api/chat` or `/api/generate` inference is authorized.
-- Model listing and inference may fail differently.
-
-Manual checks:
-
-```sh
-ollama signin
-ollama list
-ollama run gpt-oss:120b-cloud
-```
-
-The verification script distinguishes these paths:
-
-```sh
-curl https://ollama.com/api/tags \
-  -H "Authorization: Bearer $OLLAMA_API_KEY"
-
-curl https://ollama.com/v1/chat/completions \
-  -H "Authorization: Bearer $OLLAMA_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-oss:120b-cloud","messages":[{"role":"user","content":"hello"}]}'
-
-curl http://127.0.0.1:11434/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-oss:120b-cloud","stream":false,"messages":[{"role":"user","content":"hello"}]}'
-
-curl http://127.0.0.1:<LITELLM_PORT>/v1/chat/completions \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"ollama-kimi-k26-cloud","messages":[{"role":"user","content":"hello"}]}'
-```
-
-If catalog access works but inference returns `401`, check account, subscription/entitlement, model name, and endpoint. If CLI works but local daemon inference returns `401`, add the service user's public key to `https://ollama.com/settings/keys`.
-
-## Secret And Database Sanity
-
-The scripts report secrets without printing full values:
-
-```text
-LITELLM_MASTER_KEY=SET length=N prefix=sk-...
-DATABASE_URL=SET length=N prefix=postgresql://litellm:***@postgres:5432/litellm
-POSTGRES_PASSWORD=SET length=N prefix=<set>
-OLLAMA_API_KEY=MISSING
-LITELLM_CLIENT_KEY=SET length=N prefix=sk-...
-```
-
-Required LiteLLM values:
-
-- `LITELLM_MASTER_KEY`
-- `LITELLM_SALT_KEY`
-- `DATABASE_URL`
-- `POSTGRES_PASSWORD`
-
-Optional values:
-
-- `OPENROUTER_API_KEY`
-- `OLLAMA_API_KEY`
-- `LITELLM_CLIENT_KEY` for client-key tests
-
-If `POSTGRES_PASSWORD` and the password embedded in `DATABASE_URL` differ, LiteLLM may restart or fail database authentication. Repair it with:
-
-```sh
-sudo /opt/litellm-gateway/verify-litellm-gateway.sh --repair-database-url
-```
-
-This backs up `.env` and rewrites:
-
-```text
-DATABASE_URL=postgresql://litellm:${POSTGRES_PASSWORD}@postgres:5432/litellm
-```
-
-## Host And Service Sanity
-
-Every gateway script prints:
-
-```text
-You are running this on: <hostname> (<OS>)
-Detected role: <role>
-Expected role for this script: <role>
-```
-
-LiteLLM setup is expected on the Debian/Ubuntu LiteLLM gateway. If setup appears to be running on Alpine or a ZeroClaw host, it requires `--force`.
-
-Service checks:
-
-```sh
-systemctl is-enabled docker
-systemctl is-active docker
-docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml ps
-```
-
-If the stack is installed but not running:
-
-```sh
-sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml up -d
-```
-
-If Docker is disabled or inactive:
-
-```sh
-sudo systemctl enable --now docker
-```
-
-Firewall/access checks:
-
-```sh
-ss -lntp | grep 4000
-sudo ufw status verbose
-curl http://<LITELLM_HOST_IP>:<LITELLM_PORT>/v1/models \
-  -H "Authorization: Bearer $LITELLM_CLIENT_KEY"
-```
-
-If ping fails but curl works, ICMP may be blocked. If curl fails and the client should be trusted, check the LiteLLM stack, UFW allow rule for `<TRUSTED_CLIENT_CIDR>` to `<LITELLM_PORT>`, Proxmox firewall, wrong IP, and Docker port binding.
+The response field named `key` is the client API key. `token_id` is not the API key.
 
 ## Startup After Snapshot Or Reboot
 

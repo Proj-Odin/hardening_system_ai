@@ -19,18 +19,11 @@ MAX_BUDGET="${MAX_BUDGET:-10}"
 BUDGET_DURATION="${BUDGET_DURATION:-30d}"
 INCLUDE_OPENROUTER=0
 YES=0
-REPAIR_DATABASE_URL=0
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
-  # shellcheck disable=SC1091
-  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
-fi
 
 usage() {
   cat <<'EOF'
@@ -48,7 +41,6 @@ Options:
   --docker-litellm-subnet CIDR    Docker subnet allowed to reach host Ollama.
   --ollama-host-bind HOST:PORT    Ollama service bind. Default: 0.0.0.0:11434.
   --zeroclaw-host-ip IP           Optional ZeroClaw host IP for saved examples/tests.
-  --repair-database-url           Rewrite DATABASE_URL from POSTGRES_PASSWORD if they differ.
   --yes                           Accept detected/default non-secret network values.
   -h, --help                      Show this help.
 
@@ -66,7 +58,6 @@ parse_args() {
     case "$1" in
       --yes) YES=1 ;;
       --include-openrouter) INCLUDE_OPENROUTER=1 ;;
-      --repair-database-url) REPAIR_DATABASE_URL=1 ;;
       --alias)
         shift
         [ "$#" -gt 0 ] || die_arg "--alias"
@@ -131,22 +122,11 @@ parse_args() {
 
 source_env_file() {
   local file="$1"
-  local owner_uid
-  local mode
   [ -f "$file" ] || return 0
-  owner_uid="$(stat -c '%u' "$file" 2>/dev/null || true)"
-  mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
-  [ "$owner_uid" = "0" ] || die "${file} must be root-owned before it is sourced."
-  [ "$mode" = "600" ] || die "${file} must be chmod 600 before it is sourced."
   # shellcheck disable=SC1090
   set -a
   . "$file"
   set +a
-}
-
-load_gateway_env_file() {
-  declare -F load_gateway_env_safe >/dev/null 2>&1 || return 0
-  load_gateway_env_safe "$GATEWAY_ENV_FILE"
 }
 
 detect_primary_ip() {
@@ -222,8 +202,6 @@ create_key() {
   local curl_error
   local client_key
   local token_id
-  local key_dir
-  local key_file
 
   [ -n "${LITELLM_MASTER_KEY:-}" ] || die "LITELLM_MASTER_KEY is missing. This script sources ${ENV_FILE}."
   command -v jq >/dev/null 2>&1 || die "jq is required."
@@ -260,35 +238,18 @@ create_key() {
 
   client_key="$(printf '%s' "$body" | jq -r '.key // .token // empty')"
   token_id="$(printf '%s' "$body" | jq -r '.token_id // empty')"
-  key_dir="${APP_DIR}/client-keys"
-  key_file="${key_dir}/${KEY_ALIAS}-$(date +%Y%m%d_%H%M%S).json"
-  install -d -m 0700 "$key_dir"
-  printf '%s\n' "$body" > "$key_file"
-  chmod 0600 "$key_file"
 
   printf '\nLiteLLM client key created for alias: %s\n\n' "$KEY_ALIAS"
-  printf 'key field: client API key (stored in protected response file; not printed)\n'
-  printf 'key length: %s\n' "${#client_key}"
-  case "$client_key" in
-    sk-*) printf 'key prefix: sk-...\n' ;;
-    "") printf 'key prefix: MISSING\n' ;;
-    *) printf 'key prefix: <unexpected>\n' ;;
-  esac
-  printf 'token_id: %s\n' "${token_id:-<missing from response>}"
-  printf 'protected response file: %s\n\n' "$key_file"
-  printf 'Use the response field named "key" as the client API key. "token_id" is not the API key.\n'
+  printf 'key:\n  %s\n\n' "${client_key:-<missing from response>}"
+  printf 'token_id:\n  %s\n\n' "${token_id:-<missing from response>}"
+  printf 'Use "key" as the client API key. "token_id" is not the API key.\n'
 }
 
 main() {
   source_env_file "$ENV_FILE"
-  load_gateway_env_file
+  source_env_file "$GATEWAY_ENV_FILE"
   parse_args "$@"
   collect_settings
-  if declare -F sanity_host_banner >/dev/null 2>&1; then
-    sanity_host_banner "LiteLLM gateway client-key creation host" "$APP_DIR" "${APP_DIR}/docker-compose.yml"
-    sanity_env_report "$ENV_FILE"
-    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
-  fi
   create_key
 }
 
