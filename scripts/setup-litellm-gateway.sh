@@ -71,6 +71,14 @@ die() {
   exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
+  # shellcheck disable=SC1091
+  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
+else
+  warn "litellm-sanity-lib.sh not found; account sanity checks will be limited."
+fi
+
 usage() {
   cat <<'EOF'
 Usage: setup-litellm-gateway.sh [options]
@@ -1099,6 +1107,12 @@ main() {
   parse_args "$@"
   require_root
   setup_logging
+  if declare -F sanity_host_banner >/dev/null 2>&1; then
+    sanity_host_banner "LiteLLM setup host" "$APP_DIR" "$COMPOSE_FILE"
+    sanity_ollama_identity_check
+    sanity_env_report "$ENV_FILE"
+    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
+  fi
   detect_os
   apply_existing_settings
   collect_network_settings
@@ -1119,11 +1133,15 @@ main() {
   litellm_digest="$(pull_and_resolve_digest "$LITELLM_IMAGE")"
   cosign_verify_image "$LITELLM_IMAGE"
   cosign_verify_image "$litellm_digest"
-  align_config_permissions_for_image "$litellm_digest"
   postgres_digest="$(pull_and_resolve_digest "$POSTGRES_IMAGE")"
 
-  validate_config_with_container "$litellm_digest"
   write_compose_file "$litellm_digest" "$postgres_digest"
+  ensure_compose_network_exists
+  collect_docker_bridge_settings
+  write_gateway_env_file
+  write_litellm_config
+  align_config_permissions_for_image "$litellm_digest"
+  validate_config_with_container "$litellm_digest"
   write_egress_allowlist
   configure_ufw
   write_docker_user_rules
