@@ -93,6 +93,17 @@ mem_limit: 2g
 
 LiteLLM/Prisma writes cache, migration, and sanity-check files during startup. A fully read-only service filesystem can leave the process started but with no port open and empty logs. The memory limit is `2g` because startup can approach the old `1g` budget.
 
+The LiteLLM service also uses Docker Compose's tiny init process:
+
+```yaml
+restart: unless-stopped
+init: true
+env_file:
+  - .env
+```
+
+LiteLLM may spawn Node/Prisma helper processes during startup and migrations. Without an init process, dead child processes can appear as zombies, such as `node-MainThread <defunct>`. Compose `init: true` enables Docker's tiny init process to reap children. This is expected container hygiene and does not weaken the existing security posture.
+
 Health checks use:
 
 ```text
@@ -281,6 +292,7 @@ After setup and bridge configuration:
 
 - Empty Docker logs plus no port `4000`: likely a fully read-only LiteLLM filesystem.
 - LiteLLM health stuck: check `/health` versus `/health/liveliness`.
+- Symptom: `node-MainThread <defunct>` appears after LiteLLM startup or restart. Fix: ensure the LiteLLM service has `init: true`, then recreate the container.
 - Ollama CLI works but local API returns unauthorized: the daemon runs as the `ollama` user and its service public key must be added at `https://ollama.com/settings/keys`.
 - Container cannot reach host Ollama: check `OLLAMA_HOST=<OLLAMA_HOST_BIND>` and the UFW rule for `<DOCKER_LITELLM_SUBNET>`.
 - Client cannot reach LiteLLM: make sure the stack is running and UFW allows `<TRUSTED_CLIENT_CIDR>` to `<LITELLM_PORT>/tcp`.
