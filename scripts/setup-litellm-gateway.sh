@@ -872,6 +872,7 @@ services:
   litellm:
     image: ${litellm_digest}
     restart: unless-stopped
+    init: true
     env_file:
       - .env
       - gateway.env
