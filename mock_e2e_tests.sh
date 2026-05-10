@@ -96,8 +96,17 @@ else
 fi
 
 echo ""
-echo "[TEST 3] SSH Port Detection Regression"
+echo "[TEST 3] SSH Regression"
 run_logged "test_ssh_port_detection.sh" bash "${REPO_ROOT}/test_ssh_port_detection.sh"
+run_logged "test_ssh_hardening_config.sh" bash "${REPO_ROOT}/test_ssh_hardening_config.sh"
+
+echo ""
+echo "[TEST 4] Docker Package Flow Regression"
+run_logged "test_docker_package_flow.sh" bash "${REPO_ROOT}/test_docker_package_flow.sh"
+
+echo ""
+echo "[TEST 5] ZeroClaw Embedding Verifier Timeout Regression"
+run_logged "test_zeroclaw_embedding_safety_verifier.sh" bash "${REPO_ROOT}/test_zeroclaw_embedding_safety_verifier.sh"
 
 echo ""
 echo "[TEST 4] Docker Package Flow Regression"
@@ -156,12 +165,13 @@ echo "[TEST 8] README Validation Notes"
 readme_checks=0
 grep -q 'verify_hardening_sync.py' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'test_ssh_port_detection.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
+grep -q 'test_ssh_hardening_config.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'mock_e2e_tests.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'TODO_CLOUD_E2E.md' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
-if [[ "${readme_checks}" -eq 4 ]]; then
-    pass_test "README validation references" "4/4"
+if [[ "${readme_checks}" -eq 5 ]]; then
+    pass_test "README validation references" "5/5"
 else
-    fail_test "README validation references" "${readme_checks}/4"
+    fail_test "README validation references" "${readme_checks}/5"
 fi
 
 echo ""

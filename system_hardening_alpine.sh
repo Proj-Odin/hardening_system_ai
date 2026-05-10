@@ -394,6 +394,76 @@ sshd_config_is_valid() {
     return 1
 }
 
+sshd_effective_config() {
+    local sshd_bin=""
+
+    if ! sshd_bin="$(resolve_sshd_binary)"; then
+        return 1
+    fi
+
+    "${sshd_bin}" -T 2>/dev/null
+}
+
+sshd_effective_value_from_text() {
+    local content="$1"
+    local key="${2,,}"
+    local line=""
+    local directive=""
+    local value=""
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        read -r directive value <<< "${line}"
+        directive="${directive,,}"
+        if [[ "${directive}" == "${key}" ]]; then
+            echo "${value}"
+            return 0
+        fi
+    done <<< "${content}"
+
+    return 1
+}
+
+validate_ssh_hardening_effective() {
+    local effective_config=""
+    local value=""
+    local failed=0
+
+    if ! effective_config="$(sshd_effective_config)"; then
+        warn "Unable to inspect effective sshd configuration with sshd -T."
+        return 1
+    fi
+
+    if ! value="$(sshd_effective_value_from_text "${effective_config}" "kbdinteractiveauthentication")" || [[ "${value}" != "no" ]]; then
+        warn "Effective SSH KbdInteractiveAuthentication is ${value:-unknown}, expected no."
+        failed=1
+    fi
+
+    if ! value="$(sshd_effective_value_from_text "${effective_config}" "passwordauthentication")"; then
+        warn "Effective SSH PasswordAuthentication is unknown, expected $([[ "${DISABLE_PASSWORD_SSH}" -eq 1 ]] && echo "no" || echo "yes")."
+        failed=1
+    elif [[ "${DISABLE_PASSWORD_SSH}" -eq 1 && "${value}" != "no" ]]; then
+        warn "Effective SSH PasswordAuthentication is ${value}, expected no."
+        failed=1
+    elif [[ "${DISABLE_PASSWORD_SSH}" -eq 0 && "${value}" != "yes" ]]; then
+        warn "Effective SSH PasswordAuthentication is ${value}, expected yes while password login is being kept available."
+        failed=1
+    fi
+
+    if [[ "${DISTRO:-}" == "ubuntu" || "${DISTRO:-}" == "debian" ]]; then
+        if ! value="$(sshd_effective_value_from_text "${effective_config}" "usepam")" || [[ "${value}" != "yes" ]]; then
+            warn "Effective SSH UsePAM is ${value:-unknown}, expected yes on Debian/Ubuntu."
+            failed=1
+        fi
+    fi
+
+    if [[ "${failed}" -eq 1 ]]; then
+        warn "Review earlier entries in /etc/ssh/sshd_config and /etc/ssh/sshd_config.d/*.conf; sshd uses the first value it reads for each setting."
+        return 1
+    fi
+
+    return 0
+}
+
 detect_ssh_port() {
     local sshd_bin=""
     local port=""
@@ -1136,8 +1206,11 @@ configure_ssh_prompt() {
     fi
 
     if ssh_keys_appear_configured; then
-        echo "SSH key(s) detected."
-        if prompt_yes_no "Disable SSH password authentication? (recommended if key login is tested)" "n"; then
+        echo "SSH key(s) detected or staged for installation."
+        if prompt_yes_no "Keep SSH password authentication enabled until key login is verified? (recommended for first run)" "y"; then
+            DISABLE_PASSWORD_SSH=0
+            add_warning "SSH password authentication will remain enabled. After verifying key login in a second session, rerun and disable passwords."
+        else
             echo
             echo "!!! STRONG WARNING !!!"
             echo "You are about to disable SSH password authentication."
@@ -1153,9 +1226,6 @@ configure_ssh_prompt() {
                 DISABLE_PASSWORD_SSH=0
                 add_warning "SSH password authentication kept enabled by operator after warning."
             fi
-        else
-            DISABLE_PASSWORD_SSH=0
-            add_warning "SSH password authentication will remain enabled."
         fi
     else
         DISABLE_PASSWORD_SSH=0
@@ -2791,6 +2861,7 @@ Port ${SSH_PORT}
 PermitRootLogin $([[ "${DISABLE_ROOT_SSH}" -eq 1 ]] && echo "no" || echo "yes")
 PasswordAuthentication $([[ "${DISABLE_PASSWORD_SSH}" -eq 1 ]] && echo "no" || echo "yes")
 PermitEmptyPasswords no
+KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PubkeyAuthentication yes
 $([[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 && "${SSH_ALLOW_ONLY_OPS}" -eq 1 ]] && echo "AllowUsers ${OPS_USER}" || echo "# AllowUsers unchanged by policy")
@@ -2803,6 +2874,9 @@ EOF
 
     if ! sshd_config_is_valid; then
         die "sshd configuration validation failed. SSH config was not applied safely."
+    fi
+    if ! validate_ssh_hardening_effective; then
+        die "Effective sshd configuration did not match the requested hardening policy. SSH config was not applied safely."
     fi
 
     enable_service_now "${SSH_SERVICE}" || warn "SSH service restart needs manual follow-up."
