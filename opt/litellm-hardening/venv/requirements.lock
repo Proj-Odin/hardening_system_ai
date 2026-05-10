@@ -1,0 +1,5 @@
+# Populate this file with pip-compile --generate-hashes before enabling the venv path.
+# The hardening scripts refuse DEPLOYMENT_MODE=venv until this file contains:
+# - litellm[proxy]==<exact version>
+# - transitive dependencies
+# - --hash=sha256: entries for every resolved wheel or sdist

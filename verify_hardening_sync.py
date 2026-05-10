@@ -15,12 +15,37 @@ ALPINE_SCRIPT = ROOT / "system_hardening_alpine.sh"
 FUNCTION_RE = re.compile(r"^([A-Za-z0-9_]+)\(\) \{$")
 
 ALPINE_ONLY_FUNCTIONS = {
+    "apply_zeroclaw_source_install",
     "choose_deployment_target",
+    "configure_zeroclaw_prompt",
+    "download_zeroclaw_source_installer",
     "enable_service_now",
     "ensure_sshd_include_dropin",
+    "ensure_zeroclaw_directories",
+    "ensure_zeroclaw_runtime_user",
+    "ensure_zeroclaw_shell_path",
+    "install_alpine_lxc_base_packages",
+    "install_zeroclaw_source_build",
     "post_apply_services_hint",
+    "queue_zeroclaw_source_packages",
     "reload_or_restart_service",
+    "remove_bad_zeroclaw_prebuilt_if_needed",
+    "run_as_zeroclaw_user",
     "service_exists",
+    "verify_alpine_lxc_tmux_install",
+    "verify_zeroclaw_install",
+    "zeroclaw_glibc_prebuilt_detected",
+}
+
+DEBIAN_ONLY_FUNCTIONS = {
+    "apt_package_available",
+    "ensure_docker_apt_prerequisites",
+    "ensure_docker_apt_repo",
+    "install_docker_stack",
+    "os_release_value",
+    "select_docker_compose_package",
+    "select_docker_engine_packages",
+    "validate_docker_stack",
 }
 
 ALLOWED_SHARED_DIFFS = {
@@ -87,11 +112,18 @@ def main() -> int:
 
     errors: list[str] = []
 
-    debian_only = sorted(set(debian_funcs) - set(alpine_funcs))
+    debian_only = sorted((set(debian_funcs) - set(alpine_funcs)) - DEBIAN_ONLY_FUNCTIONS)
     if debian_only:
         errors.append(
             "Alpine is missing shared functions from system_hardening.sh: "
             + ", ".join(debian_only)
+        )
+
+    missing_debian_only = sorted(DEBIAN_ONLY_FUNCTIONS - (set(debian_funcs) - set(alpine_funcs)))
+    if missing_debian_only:
+        errors.append(
+            "Expected Debian-only helper functions are missing or unexpectedly shared: "
+            + ", ".join(missing_debian_only)
         )
 
     alpine_only = set(alpine_funcs) - set(debian_funcs)
@@ -145,10 +177,12 @@ def main() -> int:
 
     approved_diff_count = len(ALLOWED_SHARED_DIFFS)
     alpine_helper_count = len(alpine_only)
+    debian_helper_count = len(DEBIAN_ONLY_FUNCTIONS)
     print("Hardening mirror check passed.")
     print(f"- Exact shared function matches: {exact_match_count}")
     print(f"- Approved Alpine-specific shared overrides: {approved_diff_count}")
     print(f"- Alpine-only helper functions: {alpine_helper_count}")
+    print(f"- Debian-only helper functions: {debian_helper_count}")
     return 0
 
 

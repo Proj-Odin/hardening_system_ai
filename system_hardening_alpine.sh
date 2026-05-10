@@ -54,6 +54,7 @@ SSH_PORT="22"
 DISABLE_ROOT_SSH=1
 DISABLE_PASSWORD_SSH=0
 SSH_RATE_LIMIT=1
+DISABLE_IPV6="${HARDEN_DISABLE_IPV6:-${DISABLE_IPV6:-false}}"
 MANAGE_ACCESS_ACCOUNTS=0
 OPS_USER="ops"
 ADMIN_USER="admin"
@@ -119,6 +120,18 @@ TAILSCALE_AUTHKEY=""
 
 CUSTOM_PROFILE_PORTS=""
 CUSTOM_PROFILE_PACKAGES=""
+
+declare -a ALPINE_LXC_BASE_PACKAGES=(
+    tmux
+)
+
+INSTALL_ZEROCLAW=0
+ZEROCLAW_USER="${ZEROCLAW_USER:-zeroclaw}"
+ZEROCLAW_HOME="${ZEROCLAW_HOME:-/home/${ZEROCLAW_USER}}"
+ZEROCLAW_BIN="${ZEROCLAW_HOME}/.cargo/bin/zeroclaw"
+ZEROCLAW_INSTALL_URL="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"
+ZEROCLAW_INSTALLER_PATH="${ZEROCLAW_INSTALLER_PATH:-/tmp/zeroclaw-install.sh}"
+ZEROCLAW_PATH_LINE='export PATH="/home/zeroclaw/.cargo/bin:$PATH"'
 
 # -------- Metadata --------
 declare -A PROFILE_DESCRIPTIONS=(
@@ -560,6 +573,103 @@ add_remote_warning() {
     REMOTE_ACCESS_WARNINGS+=("$*")
 }
 
+flag_enabled() {
+    case "${1:-}" in
+        1|true|TRUE|True|yes|YES|Yes|y|Y|on|ON|On) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ipv6_sysctl_keys() {
+    printf '%s\n' \
+        "net.ipv6.conf.all.disable_ipv6" \
+        "net.ipv6.conf.default.disable_ipv6" \
+        "net.ipv6.conf.lo.disable_ipv6"
+}
+
+ipv6_disable_settings_active() {
+    local key
+    local value
+
+    while IFS= read -r key; do
+        if ! value="$(sysctl -n "${key}" 2>/dev/null)"; then
+            return 1
+        fi
+        if [[ "$(trim_spaces "${value}")" != "1" ]]; then
+            return 1
+        fi
+    done < <(ipv6_sysctl_keys)
+
+    return 0
+}
+
+write_ipv6_disable_sysctl_dropin() {
+    local sysctl_file="$1"
+
+    write_file_with_backup "${sysctl_file}" <<'EOF'
+# Managed by system_hardening.sh
+# Disable IPv6 system-wide
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+}
+
+apply_ipv6_sysctl_value() {
+    local key="$1"
+    local value="$2"
+    local output=""
+
+    if output="$(sysctl -w "${key}=${value}" 2>&1)"; then
+        log "${output}"
+        return 0
+    fi
+
+    warn "Could not set ${key}=${value}: ${output:-sysctl returned non-zero}"
+}
+
+log_ipv6_validation_output() {
+    local key
+    local output=""
+    local line=""
+
+    while IFS= read -r key; do
+        if output="$(sysctl "${key}" 2>&1)"; then
+            while IFS= read -r line; do
+                log "IPv6 validation: ${line}"
+            done <<< "${output}"
+        else
+            warn "Could not read ${key}: ${output:-sysctl returned non-zero}"
+        fi
+    done < <(ipv6_sysctl_keys)
+
+    if command -v ip >/dev/null 2>&1; then
+        if output="$(ip -6 addr show 2>&1)"; then
+            if [[ -z "${output}" ]]; then
+                log "IPv6 validation: ip -6 addr show returned no addresses"
+            else
+                while IFS= read -r line; do
+                    log "IPv6 validation: ${line}"
+                done <<< "${output}"
+            fi
+        else
+            warn "Could not run ip -6 addr show: ${output:-ip returned non-zero}"
+        fi
+    else
+        warn "Could not run ip -6 addr show: ip command unavailable"
+    fi
+}
+
+apply_sysctl_system_nonfatal() {
+    local context="$1"
+
+    if sysctl --system >/dev/null; then
+        log "Applied sysctl settings for ${context}."
+    else
+        warn "sysctl --system returned non-zero while applying ${context}. Review sysctl output and current kernel/container capabilities."
+    fi
+}
+
 queue_package() {
     local pkg="$1"
     local existing
@@ -990,6 +1100,8 @@ configure_access_accounts_prompt() {
     if id -u "${ADMIN_USER}" >/dev/null 2>&1; then
         add_warning "Existing user ${ADMIN_USER} will be reused. Its password, shell, and sudo policy will be updated."
     fi
+    note_existing_group_reuse_for_requested_user "${OPS_USER}"
+    note_existing_group_reuse_for_requested_user "${ADMIN_USER}"
 
     prompt_secret_confirm OPS_PASSWORD "Password for ${OPS_USER}" "Confirm password for ${OPS_USER}"
     prompt_secret_confirm ADMIN_PASSWORD "Password for ${ADMIN_USER}" "Confirm password for ${ADMIN_USER}"
@@ -1309,6 +1421,20 @@ configure_profile_prompt() {
     esac
 }
 
+configure_zeroclaw_prompt() {
+    echo
+    echo "=== ZeroClaw Runtime (Optional) ==="
+
+    INSTALL_ZEROCLAW=0
+    if prompt_yes_no "Install ZeroClaw runtime user and Alpine-native source build?" "n"; then
+        INSTALL_ZEROCLAW=1
+        add_warning "ZeroClaw will be built from source on Alpine. Prebuilt GNU/glibc ZeroClaw binaries are not used on musl systems."
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            add_warning "ZeroClaw selected for Alpine LXC. No systemd service will be installed; use manual or OpenRC follow-up if a service is needed later."
+        fi
+    fi
+}
+
 configure_tailscale_gateway_prompt() {
     local mode_choice
     local backend_choice
@@ -1514,6 +1640,20 @@ configure_apparmor() {
     fi
 }
 
+configure_ipv6_disable_prompt() {
+    local default_choice="n"
+
+    if flag_enabled "${DISABLE_IPV6}"; then
+        default_choice="y"
+    fi
+
+    if prompt_yes_no "Disable IPv6 system-wide?" "${default_choice}"; then
+        DISABLE_IPV6=true
+    else
+        DISABLE_IPV6=false
+    fi
+}
+
 configure_unattended_upgrades() {
     local update_choice
     update_choice="$(prompt_menu "APK Update Strategy" "1" \
@@ -1535,6 +1675,7 @@ configure_base_security() {
     configure_fail2ban
     configure_unattended_upgrades
     configure_apparmor
+    configure_ipv6_disable_prompt
 }
 
 configure_security_services_prompt() {
@@ -1792,6 +1933,11 @@ build_change_plan_preview() {
         add_planned_service "apparmor (enable/start if available)"
     fi
 
+    if flag_enabled "${DISABLE_IPV6}"; then
+        add_planned_file "/etc/sysctl.d/99-disable-ipv6.conf"
+        add_planned_service "sysctl (apply IPv6 disable settings)"
+    fi
+
     case "${UPDATE_MODE}" in
         notify)
             add_planned_file "/etc/periodic/daily/homelab-apk-notify"
@@ -1802,6 +1948,15 @@ build_change_plan_preview() {
             add_planned_service "crond (enable/start)"
             ;;
     esac
+
+    if [[ "${INSTALL_ZEROCLAW}" -eq 1 ]]; then
+        add_planned_file "${ZEROCLAW_HOME}"
+        add_planned_file "${ZEROCLAW_HOME}/.zeroclaw"
+        add_planned_file "${ZEROCLAW_HOME}/.zeroclaw/workspace"
+        add_planned_file "${ZEROCLAW_HOME}/.cargo/bin/zeroclaw"
+        add_planned_file "${ZEROCLAW_HOME}/.profile"
+        add_planned_file "${ZEROCLAW_HOME}/.bashrc"
+    fi
 
     case "${PROFILE}" in
         docker-host)
@@ -1904,6 +2059,7 @@ show_summary() {
     echo "Security services:"
     echo "  Fail2Ban:              $([[ "${INSTALL_FAIL2BAN}" -eq 1 ]] && echo "install" || echo "skip")"
     echo "  AppArmor:              $([[ "${ENABLE_APPARMOR}" -eq 1 ]] && echo "enable" || echo "skip")"
+    echo "  Disable IPv6:          $(flag_enabled "${DISABLE_IPV6}" && echo "yes" || echo "no")"
     echo "  APK auto-upgrades:     $([[ "${UPDATE_MODE}" == "unattended" ]] && echo "enabled" || echo "disabled")"
     echo "  Update mode:           ${UPDATE_MODE}"
     echo
@@ -1921,6 +2077,16 @@ show_summary() {
             echo "  Allow from:            ${CHECKMK_EFFECTIVE_SOURCE}"
             checkmk_tls_label="non-TLS"
         fi
+    fi
+
+    echo
+    echo "ZeroClaw runtime:"
+    echo "  Install source build:  $([[ "${INSTALL_ZEROCLAW}" -eq 1 ]] && echo "yes" || echo "no")"
+    if [[ "${INSTALL_ZEROCLAW}" -eq 1 ]]; then
+        echo "  Runtime user:          ${ZEROCLAW_USER}"
+        echo "  Runtime home:          ${ZEROCLAW_HOME}"
+        echo "  Binary path:           ${ZEROCLAW_BIN}"
+        echo "  Service install:       no (manual/OpenRC follow-up only)"
     fi
 
     if [[ "${PROFILE}" == "tailscale-gateway" ]]; then
@@ -2118,6 +2284,47 @@ install_queued_packages() {
     apk add "${PKG_QUEUE[@]}"
 }
 
+verify_alpine_lxc_tmux_install() {
+    local tmux_version=""
+
+    log "Alpine LXC tmux post-install check: command -v tmux"
+    if ! command -v tmux >/dev/null 2>&1; then
+        warn "tmux install was attempted, but 'command -v tmux' did not find it. Continuing the hardening run."
+        return 1
+    fi
+
+    log "Alpine LXC tmux post-install check: tmux -V"
+    if tmux_version="$(tmux -V 2>&1)"; then
+        log "Alpine LXC tmux version: ${tmux_version}"
+        return 0
+    fi
+
+    warn "tmux is present, but 'tmux -V' failed: ${tmux_version}. Continuing the hardening run."
+    return 1
+}
+
+install_alpine_lxc_base_packages() {
+    local pkg
+
+    if [[ "${DEPLOYMENT_TARGET}" != "lxc" ]]; then
+        return 0
+    fi
+
+    for pkg in "${ALPINE_LXC_BASE_PACKAGES[@]}"; do
+        log "Alpine LXC base package install: apk add --no-cache ${pkg}"
+        if apk add --no-cache "${pkg}"; then
+            log "Alpine LXC base package install result: ${pkg} installed or already present"
+        else
+            warn "Failed to install Alpine LXC base package '${pkg}' with apk. Continuing the hardening run."
+            continue
+        fi
+
+        if [[ "${pkg}" == "tmux" ]]; then
+            verify_alpine_lxc_tmux_install || true
+        fi
+    done
+}
+
 prepare_package_queue() {
     # Package queue is deduplicated so reruns do not cause noisy repeat installs.
     queue_package "openssh-server"
@@ -2198,6 +2405,32 @@ prepare_package_queue() {
             ;;
     esac
 
+    if [[ "${INSTALL_ZEROCLAW}" -eq 1 ]]; then
+        queue_zeroclaw_source_packages
+    fi
+}
+
+queue_zeroclaw_source_packages() {
+    local pkg
+    local -a zeroclaw_packages=(
+        bash
+        curl
+        git
+        ca-certificates
+        shadow
+        build-base
+        rust
+        cargo
+        openssl-dev
+        pkgconf
+        sqlite-dev
+        file
+    )
+
+    log "ZeroClaw package install: queueing Alpine source-build dependencies"
+    for pkg in "${zeroclaw_packages[@]}"; do
+        queue_package "${pkg}"
+    done
 }
 
 install_tailscale_package() {
@@ -2225,16 +2458,232 @@ get_user_home() {
     getent passwd "$1" | cut -d: -f6
 }
 
+requested_username_matches_existing_group() {
+    local username="$1"
+
+    if id -u "${username}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    getent group "${username}" >/dev/null 2>&1
+}
+
+note_existing_group_reuse_for_requested_user() {
+    local username="$1"
+
+    if requested_username_matches_existing_group "${username}"; then
+        echo "Note: group ${username} already exists; the user will reuse it as the primary group."
+        add_warning "Requested username ${username} matches an existing group. The account will reuse primary group ${username} if created."
+    fi
+}
+
+create_local_user_with_group_fallback() {
+    local username="$1"
+    local login_shell="$2"
+
+    # Debian-family systems can have legacy groups such as "admin" pre-created.
+    # Make the primary group explicit in that case so useradd does not fail while
+    # trying to create a same-named group implicitly.
+    if getent group "${username}" >/dev/null 2>&1; then
+        log "User ${username} requested, but group ${username} already exists; reusing existing group as primary group"
+        if useradd -m -s "${login_shell}" -g "${username}" "${username}"; then
+            log "Created user ${username} with existing primary group ${username}"
+            return 0
+        fi
+
+        log "Failed to create user ${username} while reusing existing primary group ${username}"
+        die "Unable to create local user ${username} with existing primary group ${username}. Review 'getent passwd ${username}' and 'getent group ${username}', then rerun the script."
+    fi
+
+    if useradd -m -s "${login_shell}" "${username}"; then
+        log "Created user: ${username}"
+        return 0
+    fi
+
+    log "Failed to create user ${username} while creating a same-name primary group"
+    die "Unable to create local user ${username}. Review 'getent passwd ${username}' and 'getent group ${username}', then rerun the script."
+}
+
 ensure_local_user_present() {
     local username="$1"
     local login_shell="$2"
 
     if id -u "${username}" >/dev/null 2>&1; then
         log "User exists: ${username}"
-        usermod -s "${login_shell}" "${username}"
+        if ! usermod -s "${login_shell}" "${username}"; then
+            die "Unable to update login shell for existing user ${username}."
+        fi
+        return 0
+    fi
+
+    create_local_user_with_group_fallback "${username}" "${login_shell}"
+}
+
+ensure_zeroclaw_directories() {
+    log "ZeroClaw directory creation: ${ZEROCLAW_HOME}"
+    mkdir -p \
+        "${ZEROCLAW_HOME}" \
+        "${ZEROCLAW_HOME}/.zeroclaw" \
+        "${ZEROCLAW_HOME}/.zeroclaw/workspace" \
+        "${ZEROCLAW_HOME}/.cargo/bin"
+    chown -R "${ZEROCLAW_USER}:${ZEROCLAW_USER}" "${ZEROCLAW_HOME}"
+    chmod 0700 "${ZEROCLAW_HOME}" "${ZEROCLAW_HOME}/.zeroclaw" "${ZEROCLAW_HOME}/.cargo"
+    chmod 0755 "${ZEROCLAW_HOME}/.cargo/bin"
+}
+
+ensure_zeroclaw_shell_path() {
+    local rc_file
+
+    log "ZeroClaw PATH setup: ${ZEROCLAW_HOME}/.profile and .bashrc"
+    for rc_file in "${ZEROCLAW_HOME}/.profile" "${ZEROCLAW_HOME}/.bashrc"; do
+        mkdir -p "$(dirname "${rc_file}")"
+        touch "${rc_file}"
+        if ! grep -Fxq "${ZEROCLAW_PATH_LINE}" "${rc_file}"; then
+            printf '%s\n' "${ZEROCLAW_PATH_LINE}" >> "${rc_file}"
+            log "Added ZeroClaw PATH line to ${rc_file}"
+        else
+            log "ZeroClaw PATH line already present in ${rc_file}"
+        fi
+        chown "${ZEROCLAW_USER}:${ZEROCLAW_USER}" "${rc_file}"
+        chmod 0600 "${rc_file}"
+    done
+}
+
+ensure_zeroclaw_runtime_user() {
+    local login_shell="/bin/ash"
+    local passwd_entry=""
+    local current_home=""
+    local current_shell=""
+    local -a adduser_cmd
+
+    log "ZeroClaw user creation: ensuring ${ZEROCLAW_USER}"
+    if id -u "${ZEROCLAW_USER}" >/dev/null 2>&1; then
+        log "ZeroClaw user exists: ${ZEROCLAW_USER}"
+        passwd_entry="$(getent passwd "${ZEROCLAW_USER}" 2>/dev/null || true)"
+        if [[ -n "${passwd_entry}" ]]; then
+            IFS=':' read -r _ _ _ _ _ current_home current_shell <<< "${passwd_entry}"
+        fi
+
+        if [[ "${current_shell:-}" != "${login_shell}" ]]; then
+            if command -v usermod >/dev/null 2>&1; then
+                usermod -s "${login_shell}" "${ZEROCLAW_USER}" || warn "Unable to update shell for existing ZeroClaw user ${ZEROCLAW_USER}; continuing."
+            else
+                warn "usermod is unavailable; cannot reconcile shell for existing ZeroClaw user ${ZEROCLAW_USER}."
+            fi
+        fi
+
+        if [[ -n "${current_home:-}" && "${current_home}" != "${ZEROCLAW_HOME}" ]]; then
+            if command -v usermod >/dev/null 2>&1; then
+                usermod -d "${ZEROCLAW_HOME}" "${ZEROCLAW_USER}" || warn "Unable to update home for existing ZeroClaw user ${ZEROCLAW_USER}; continuing."
+            else
+                warn "usermod is unavailable; cannot reconcile home for existing ZeroClaw user ${ZEROCLAW_USER}."
+            fi
+        fi
     else
-        useradd -m -s "${login_shell}" "${username}"
-        log "Created user: ${username}"
+        adduser_cmd=(adduser -D -s "${login_shell}")
+        if [[ "${ZEROCLAW_HOME}" != "/home/${ZEROCLAW_USER}" ]]; then
+            adduser_cmd+=(-h "${ZEROCLAW_HOME}")
+        fi
+        if getent group "${ZEROCLAW_USER}" >/dev/null 2>&1; then
+            log "ZeroClaw group ${ZEROCLAW_USER} already exists; reusing it for the runtime user"
+            adduser_cmd+=(-G "${ZEROCLAW_USER}")
+        else
+            log "ZeroClaw group ${ZEROCLAW_USER} does not exist yet; adduser will create the default primary group"
+        fi
+        adduser_cmd+=("${ZEROCLAW_USER}")
+        "${adduser_cmd[@]}"
+        log "Created ZeroClaw runtime user: ${ZEROCLAW_USER}"
+    fi
+
+    ensure_zeroclaw_directories
+    ensure_zeroclaw_shell_path
+}
+
+zeroclaw_glibc_prebuilt_detected() {
+    local bin="${1:-${ZEROCLAW_BIN}}"
+    local file_output=""
+
+    [[ -f "${bin}" ]] || return 1
+    command -v file >/dev/null 2>&1 || return 1
+
+    file_output="$(file "${bin}" 2>/dev/null || true)"
+    [[ "${file_output}" == *"dynamically linked"* && "${file_output}" == *"interpreter /lib64/ld-linux-x86-64.so.2"* ]]
+}
+
+remove_bad_zeroclaw_prebuilt_if_needed() {
+    local bin="${1:-${ZEROCLAW_BIN}}"
+
+    if zeroclaw_glibc_prebuilt_detected "${bin}"; then
+        warn "Detected GNU/glibc ZeroClaw binary on Alpine. Alpine uses musl, so prebuilt GNU binaries may fail with 'not found' or relocation errors. Replacing with Alpine-native source build."
+        log "ZeroClaw source build: removing incompatible prebuilt binary at ${bin}"
+        rm -f "${bin}"
+    elif [[ -f "${bin}" && ! -x "${bin}" ]]; then
+        warn "Existing ZeroClaw binary is not executable. Replacing it with Alpine-native source build."
+        rm -f "${bin}"
+    fi
+}
+
+run_as_zeroclaw_user() {
+    local command_text="$1"
+
+    log "RUN as ${ZEROCLAW_USER}: ${command_text}"
+    if [[ -n "${LOGFILE}" ]]; then
+        su - "${ZEROCLAW_USER}" -c "${command_text}" 2>&1 | tee -a "${LOGFILE}"
+    else
+        su - "${ZEROCLAW_USER}" -c "${command_text}"
+    fi
+}
+
+download_zeroclaw_source_installer() {
+    log "ZeroClaw source installer download: ${ZEROCLAW_INSTALL_URL}"
+    curl -fsSL "${ZEROCLAW_INSTALL_URL}" -o "${ZEROCLAW_INSTALLER_PATH}"
+    chmod 0755 "${ZEROCLAW_INSTALLER_PATH}"
+    log "ZeroClaw source installer downloaded: ${ZEROCLAW_INSTALLER_PATH}"
+}
+
+install_zeroclaw_source_build() {
+    log "ZeroClaw source build start"
+    remove_bad_zeroclaw_prebuilt_if_needed "${ZEROCLAW_BIN}"
+    download_zeroclaw_source_installer
+    if run_as_zeroclaw_user "sh ${ZEROCLAW_INSTALLER_PATH} --source --skip-onboard"; then
+        log "ZeroClaw source build result: success"
+    else
+        log "ZeroClaw source build result: failed"
+        die "ZeroClaw source build failed. Review ${LOGFILE:-console output} and rerun after fixing the build issue."
+    fi
+    chown -R "${ZEROCLAW_USER}:${ZEROCLAW_USER}" "${ZEROCLAW_HOME}"
+}
+
+verify_zeroclaw_install() {
+    log "ZeroClaw version check"
+    if run_as_zeroclaw_user "${ZEROCLAW_BIN} --version"; then
+        log "ZeroClaw version check result: success"
+    else
+        log "ZeroClaw version check result: failed"
+        die "ZeroClaw binary did not run after source build: ${ZEROCLAW_BIN}"
+    fi
+
+    log "ZeroClaw doctor result"
+    if run_as_zeroclaw_user "${ZEROCLAW_BIN} doctor"; then
+        log "ZeroClaw doctor result: success"
+    else
+        warn "ZeroClaw doctor reported issues. This can be expected before onboarding; run it again as ${ZEROCLAW_USER} after 'zeroclaw onboard'."
+    fi
+}
+
+apply_zeroclaw_source_install() {
+    if [[ "${INSTALL_ZEROCLAW}" -ne 1 ]]; then
+        return 0
+    fi
+
+    log "ZeroClaw package install complete; starting runtime setup"
+    ensure_zeroclaw_runtime_user
+    install_zeroclaw_source_build
+    verify_zeroclaw_install
+    log "ZeroClaw Alpine-native source install complete"
+
+    if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+        log "ZeroClaw service install skipped for Alpine LXC; use manual/OpenRC follow-up if needed."
     fi
 }
 
@@ -2474,6 +2923,35 @@ EOF
     esac
 }
 
+apply_ipv6_disable() {
+    local disable_ipv6="${1:-${DISABLE_IPV6:-false}}"
+    local sysctl_file="${2:-/etc/sysctl.d/99-disable-ipv6.conf}"
+    local key
+
+    if ! flag_enabled "${disable_ipv6}"; then
+        log "IPv6 disable option not selected; leaving IPv6 configuration unchanged."
+        return 0
+    fi
+
+    if ipv6_disable_settings_active; then
+        log "IPv6 is already disabled by active sysctl settings; refreshing managed drop-in."
+    else
+        log "Disabling IPv6 via managed sysctl drop-in: ${sysctl_file}"
+    fi
+
+    write_ipv6_disable_sysctl_dropin "${sysctl_file}"
+
+    while IFS= read -r key; do
+        apply_ipv6_sysctl_value "${key}" "1"
+    done < <(ipv6_sysctl_keys)
+
+    if [[ -f /etc/default/ufw ]] && grep -Eq '^[[:space:]]*IPV6="?yes"?' /etc/default/ufw; then
+        log "Leaving /etc/default/ufw IPV6 setting unchanged; IPv6 is disabled at the sysctl layer."
+    fi
+
+    log_ipv6_validation_output
+}
+
 apply_checkmk() {
     if [[ "${INSTALL_CHECKMK}" -ne 1 ]]; then
         return
@@ -2637,7 +3115,7 @@ apply_tailscale_gateway_profile() {
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-            sysctl --system >/dev/null
+            apply_sysctl_system_nonfatal "tailscale gateway forwarding"
         fi
     fi
 
@@ -2789,13 +3267,16 @@ apply_all_changes() {
 
     run_cmd apk update
     install_queued_packages
+    install_alpine_lxc_base_packages
 
+    apply_zeroclaw_source_install
     apply_access_accounts
     apply_ssh_hardening
     apply_ufw
     apply_fail2ban
     apply_apparmor
     apply_update_mode
+    apply_ipv6_disable
     apply_checkmk
     apply_profile_specific
 
@@ -2832,6 +3313,17 @@ print_post_apply() {
     if [[ "${INSTALL_CHECKMK}" -eq 1 && "${CHECKMK_COMM_MODE}" == "tls" ]]; then
         echo "${next_step}) Complete Checkmk TLS registration (cmk-agent-ctl register)."
     fi
+    if [[ "${INSTALL_ZEROCLAW}" -eq 1 ]]; then
+        echo
+        echo "ZeroClaw next steps:"
+        echo "  su - ${ZEROCLAW_USER}"
+        echo "  export PATH=\"/home/zeroclaw/.cargo/bin:\$PATH\""
+        echo "  zeroclaw onboard"
+        echo "  zeroclaw agent"
+        if [[ "${DEPLOYMENT_TARGET}" == "lxc" ]]; then
+            echo "  Alpine LXC note: no systemd service was installed. Use manual process supervision or add an OpenRC service later if needed."
+        fi
+    fi
     echo "======================================================"
 }
 
@@ -2856,6 +3348,7 @@ run_interactive_wizard() {
     configure_ssh
     configure_firewall
     configure_profile_prompt
+    configure_zeroclaw_prompt
     configure_base_security
     configure_checkmk
 }
