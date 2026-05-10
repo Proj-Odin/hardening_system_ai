@@ -69,6 +69,7 @@ ALLOWED_SHARED_DIFFS = {
     "configure_tailscale_gateway_prompt",
     "configure_unattended_upgrades",
     "detect_environment",
+    "ensure_virtualization_detector_loaded",
     "install_queued_packages",
     "install_tailscale_package",
     "main",

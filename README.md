@@ -97,6 +97,8 @@ The base security step can install and enable `qemu-guest-agent` for full Proxmo
 
 On Debian/Ubuntu, the script installs `qemu-guest-agent` when available and enables `qemu-guest-agent.service`. On Alpine VM targets, it installs `qemu-guest-agent` plus `qemu-guest-agent-openrc` when OpenRC is detected, then enables the `qemu-guest-agent` service. This does not open firewall ports. In Proxmox, also enable **QEMU Guest Agent** in the VM options.
 
+Virtualization detection is shared by the Debian/Ubuntu and Alpine scripts through `lib/hardening-common.sh`, which is sourced relative to each script path so startup does not depend on the caller's working directory.
+
 ## Checkmk Integration (All Profiles)
 
 The hardening script includes an optional Checkmk stage for every profile.
@@ -126,6 +128,7 @@ For Alpine:
 - SSH allow rule is added before firewall enable
 - Existing and new SSH ports are both allowed when port is changed
 - SSH password authentication stays available by default until key login is verified; rerun the hardening script after testing keys to disable passwords
+- The managed SSH policy is written to `/etc/ssh/sshd_config.d/00-homelab-hardening.conf` so it wins OpenSSH's first-value global directive ordering; old managed `99-homelab-hardening.conf` files are removed during apply
 - Debian/Ubuntu SSH keeps `UsePAM yes` for PAM account/session processing while disabling keyboard-interactive auth separately
 - Optional SSH rate limiting in both SSH and UFW flow
 - Optional QEMU guest agent install for Proxmox/QEMU VMs; skipped for LXC/container targets
@@ -274,6 +277,7 @@ sudo /opt/litellm-gateway/backup-litellm-gateway.sh
 ## Validation
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
+- Run `bash test_startup_virtualization_detection.sh` after touching startup environment or virtualization detection logic.
 - Run `bash test_ssh_port_detection.sh` and `bash test_ssh_hardening_config.sh` after touching SSH detection, validation, or login-policy logic.
 - Run `bash test_qemu_guest_agent_flow.sh` after touching Proxmox/QEMU guest-agent logic.
 - Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.

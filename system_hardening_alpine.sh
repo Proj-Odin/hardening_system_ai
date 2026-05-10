@@ -18,6 +18,15 @@ SCRIPT_VERSION="3.4-alpine"
 # Keep shared wizard/apply behavior mirrored with system_hardening.sh unless
 # Alpine packaging, init, service, or VM/LXC constraints require a divergence.
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HARDENING_COMMON_LIB="${SCRIPT_DIR}/lib/hardening-common.sh"
+if [[ ! -r "${HARDENING_COMMON_LIB}" ]]; then
+    echo "ERROR: internal shared hardening module not found or unreadable: ${HARDENING_COMMON_LIB}" >&2
+    exit 1
+fi
+# shellcheck source=lib/hardening-common.sh
+. "${HARDENING_COMMON_LIB}"
+
 # -------- Runtime State --------
 DISTRO=""
 DISTRO_VERSION=""
@@ -27,6 +36,10 @@ CURRENT_SSH_PORT="22"
 INIT_SYSTEM=""
 DEPLOYMENT_TARGET="${HARDENING_TARGET_PRESET:-}"
 DETECTED_VIRT="unknown"
+SSHD_CONFIG_FILE="${SSHD_CONFIG_FILE:-/etc/ssh/sshd_config}"
+SSHD_CONFIG_D_DIR="${SSHD_CONFIG_D_DIR:-/etc/ssh/sshd_config.d}"
+SSH_HARDENING_DROPIN="${SSH_HARDENING_DROPIN:-${SSHD_CONFIG_D_DIR}/00-homelab-hardening.conf}"
+SSH_LEGACY_HARDENING_DROPIN="${SSH_LEGACY_HARDENING_DROPIN:-${SSHD_CONFIG_D_DIR}/99-homelab-hardening.conf}"
 
 LOG_DIR="/var/log/homelab-hardening"
 BACKUP_ROOT="/var/backups/homelab-hardening"
@@ -423,8 +436,36 @@ sshd_effective_value_from_text() {
     return 1
 }
 
+ssh_policy_config_files() {
+    local -a files=()
+    shopt -s nullglob
+    files=("${SSHD_CONFIG_FILE}" "${SSHD_CONFIG_D_DIR}"/*.conf)
+    shopt -u nullglob
+    printf '%s\n' "${files[@]}"
+}
+
+report_ssh_policy_directives() {
+    local line=""
+    local -a files=()
+
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] && files+=("${line}")
+    done < <(ssh_policy_config_files)
+
+    if (( ${#files[@]} == 0 )); then
+        warn "No SSH config files found while looking for conflicting policy directives."
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        warn "SSH policy directive: ${line}"
+    done < <(grep -HnEi '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin|PubkeyAuthentication|UsePAM)[[:space:]]+' "${files[@]}" 2>/dev/null || true)
+}
+
 validate_ssh_hardening_effective() {
     local effective_config=""
+    local expected_password=""
+    local expected_root=""
     local value=""
     local failed=0
 
@@ -438,14 +479,26 @@ validate_ssh_hardening_effective() {
         failed=1
     fi
 
+    expected_password="$([[ "${DISABLE_PASSWORD_SSH}" -eq 1 ]] && echo "no" || echo "yes")"
     if ! value="$(sshd_effective_value_from_text "${effective_config}" "passwordauthentication")"; then
-        warn "Effective SSH PasswordAuthentication is unknown, expected $([[ "${DISABLE_PASSWORD_SSH}" -eq 1 ]] && echo "no" || echo "yes")."
+        warn "Effective SSH PasswordAuthentication is unknown, expected ${expected_password}."
         failed=1
-    elif [[ "${DISABLE_PASSWORD_SSH}" -eq 1 && "${value}" != "no" ]]; then
-        warn "Effective SSH PasswordAuthentication is ${value}, expected no."
+    elif [[ "${value}" != "${expected_password}" ]]; then
+        warn "Effective SSH PasswordAuthentication is ${value}, expected ${expected_password}$([[ "${DISABLE_PASSWORD_SSH}" -eq 0 ]] && echo " while password login is being kept available" || true)."
         failed=1
-    elif [[ "${DISABLE_PASSWORD_SSH}" -eq 0 && "${value}" != "yes" ]]; then
-        warn "Effective SSH PasswordAuthentication is ${value}, expected yes while password login is being kept available."
+    fi
+
+    expected_root="$([[ "${DISABLE_ROOT_SSH}" -eq 1 ]] && echo "no" || echo "yes")"
+    if ! value="$(sshd_effective_value_from_text "${effective_config}" "permitrootlogin")"; then
+        warn "Effective SSH PermitRootLogin is unknown, expected ${expected_root}."
+        failed=1
+    elif [[ "${value}" != "${expected_root}" ]]; then
+        warn "Effective SSH PermitRootLogin is ${value}, expected ${expected_root}."
+        failed=1
+    fi
+
+    if ! value="$(sshd_effective_value_from_text "${effective_config}" "pubkeyauthentication")" || [[ "${value}" != "yes" ]]; then
+        warn "Effective SSH PubkeyAuthentication is ${value:-unknown}, expected yes."
         failed=1
     fi
 
@@ -457,7 +510,8 @@ validate_ssh_hardening_effective() {
     fi
 
     if [[ "${failed}" -eq 1 ]]; then
-        warn "Review earlier entries in /etc/ssh/sshd_config and /etc/ssh/sshd_config.d/*.conf; sshd uses the first value it reads for each setting."
+        report_ssh_policy_directives
+        warn "Review earlier entries in ${SSHD_CONFIG_FILE} and ${SSHD_CONFIG_D_DIR}/*.conf; sshd uses the first value it reads for each setting."
         return 1
     fi
 
@@ -493,29 +547,6 @@ detect_ssh_port() {
     echo "22"
 }
 
-detect_virtualization() {
-    local detected="unknown"
-
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        detected="$(systemd-detect-virt 2>/dev/null || true)"
-    fi
-
-    if [[ -z "${detected}" || "${detected}" == "none" ]]; then
-        detected="unknown"
-        if grep -qaE 'container=lxc|lxc' /proc/1/environ 2>/dev/null || \
-           grep -qaE '(^|/)lxc(/|$)' /proc/1/cgroup 2>/dev/null || \
-           [[ -f /dev/lxc ]]; then
-            detected="lxc"
-        elif grep -qaE '(^|/)docker(/|$)|(^|/)kubepods(/|$)' /proc/1/cgroup 2>/dev/null || \
-             [[ -f /.dockerenv ]] || \
-             { [[ -r /proc/1/environ ]] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container='; }; then
-            detected="container"
-        fi
-    fi
-
-    echo "${detected}"
-}
-
 is_lxc_or_container() {
     [[ "${DEPLOYMENT_TARGET:-}" == "lxc" || "${DETECTED_VIRT:-unknown}" == "lxc" || "${DETECTED_VIRT:-unknown}" == "container" ]]
 }
@@ -534,6 +565,14 @@ qemu_guest_agent_default() {
             echo "n"
             ;;
     esac
+}
+
+ensure_virtualization_detector_loaded() {
+    if declare -F detect_virtualization >/dev/null 2>&1; then
+        return 0
+    fi
+
+    die "Internal error: detect_virtualization is not defined before detect_environment. Shared module failed to load: ${HARDENING_COMMON_LIB:-unknown}."
 }
 
 detect_environment() {
@@ -560,7 +599,11 @@ detect_environment() {
         INIT_SYSTEM="none"
     fi
 
-    DETECTED_VIRT="$(detect_virtualization)"
+    ensure_virtualization_detector_loaded
+    if ! DETECTED_VIRT="$(detect_virtualization)"; then
+        warn "Virtualization detection failed unexpectedly; continuing with safe default 'unknown'."
+        DETECTED_VIRT="unknown"
+    fi
 
     if [[ "${INIT_SYSTEM}" == "systemd" ]] && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "sshd.service"; then
         SSH_SERVICE="sshd"
@@ -1582,7 +1625,10 @@ configure_tailscale_gateway_prompt() {
         TAILSCALE_ENABLE_SSH=1
         if prompt_yes_no "Require stronger auth/check mode for admin or root?" "y"; then
             TAILSCALE_STRONG_ADMIN_CHECK=1
+            DISABLE_ROOT_SSH=1
+            DISABLE_PASSWORD_SSH=1
             add_warning "Strong admin/root mode enabled for Tailscale SSH."
+            add_warning "Strong admin/root mode will enforce root SSH and password SSH disabled in the primary SSH hardening drop-in."
         else
             TAILSCALE_STRONG_ADMIN_CHECK=0
             add_warning "Tailscale SSH enabled without strong admin/root mode."
@@ -1919,7 +1965,7 @@ build_change_plan_preview() {
     PLANNED_FILES=()
     PLANNED_SERVICES=()
 
-    add_planned_file "/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
+    add_planned_file "${SSH_HARDENING_DROPIN}"
     add_planned_file "/etc/ssh/sshd_config (include drop-in, if needed)"
     add_planned_service "${SSH_SERVICE} (reload/restart)"
 
@@ -2703,7 +2749,7 @@ ssh_allowusers_conflict_exists() {
     local -a files=()
 
     shopt -s nullglob
-    files=(/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf)
+    files=("${SSHD_CONFIG_FILE}" "${SSHD_CONFIG_D_DIR}"/*.conf)
     shopt -u nullglob
 
     for cfg in "${files[@]}"; do
@@ -2714,6 +2760,28 @@ ssh_allowusers_conflict_exists() {
     done
 
     return 1
+}
+
+homelab_managed_file() {
+    local file="$1"
+    [[ -f "${file}" ]] && grep -q '^# Managed by homelab hardening script' "${file}"
+}
+
+remove_legacy_ssh_hardening_dropin() {
+    if [[ "${SSH_LEGACY_HARDENING_DROPIN}" == "${SSH_HARDENING_DROPIN}" ]]; then
+        return 0
+    fi
+    if [[ ! -f "${SSH_LEGACY_HARDENING_DROPIN}" ]]; then
+        return 0
+    fi
+
+    if homelab_managed_file "${SSH_LEGACY_HARDENING_DROPIN}"; then
+        backup_config "${SSH_LEGACY_HARDENING_DROPIN}"
+        rm -f "${SSH_LEGACY_HARDENING_DROPIN}"
+        log "Removed legacy managed SSH hardening drop-in: ${SSH_LEGACY_HARDENING_DROPIN}"
+    else
+        warn "Legacy SSH hardening path exists but is not clearly managed by this script; leaving it in place: ${SSH_LEGACY_HARDENING_DROPIN}"
+    fi
 }
 
 apply_access_accounts() {
@@ -2787,8 +2855,9 @@ apply_ssh_hardening() {
     # SSH is validated with sshd -t before reload/restart to prevent lockout.
     log "Applying SSH hardening"
 
-    local ssh_dropin="/etc/ssh/sshd_config.d/99-homelab-hardening.conf"
+    local ssh_dropin="${SSH_HARDENING_DROPIN}"
     ensure_sshd_include_dropin
+    remove_legacy_ssh_hardening_dropin
 
     if [[ "${MANAGE_ACCESS_ACCOUNTS}" -eq 1 && "${SSH_ALLOW_ONLY_OPS}" -eq 1 ]] && \
        ssh_allowusers_conflict_exists "${ssh_dropin}"; then

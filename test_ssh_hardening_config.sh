@@ -15,9 +15,17 @@ run_debian_apply_case() {
         set -euo pipefail
         source "${SCRIPT_PATH}"
 
+        temp_dir="$(mktemp -d)"
+        trap "rm -rf \"${temp_dir}\"" EXIT
+        mkdir -p "${temp_dir}/sshd_config.d"
+
         TEST_DROPIN=""
         TEST_WRITE_TARGET=""
 
+        SSHD_CONFIG_FILE="${temp_dir}/sshd_config"
+        SSHD_CONFIG_D_DIR="${temp_dir}/sshd_config.d"
+        SSH_HARDENING_DROPIN="${SSHD_CONFIG_D_DIR}/00-homelab-hardening.conf"
+        SSH_LEGACY_HARDENING_DROPIN="${SSHD_CONFIG_D_DIR}/99-homelab-hardening.conf"
         DISTRO="ubuntu"
         SSH_PORT="22"
         DISABLE_ROOT_SSH=1
@@ -28,6 +36,7 @@ run_debian_apply_case() {
 
         log() { :; }
         warn() { :; }
+        backup_config() { :; }
         die() {
             echo "FAIL ${CASE_NAME}: $*" >&2
             exit 1
@@ -40,14 +49,25 @@ run_debian_apply_case() {
         sshd_effective_config() {
             printf "passwordauthentication %s\n" "${TEST_EXPECTED_PASSWORD}"
             printf "kbdinteractiveauthentication no\n"
+            printf "permitrootlogin no\n"
+            printf "pubkeyauthentication yes\n"
             printf "usepam yes\n"
         }
         systemctl() { return 0; }
 
+        cat > "${SSH_LEGACY_HARDENING_DROPIN}" <<EOF
+# Managed by homelab hardening script (old path)
+PasswordAuthentication no
+EOF
+
         apply_ssh_hardening
 
-        [[ "${TEST_WRITE_TARGET}" == "/etc/ssh/sshd_config.d/99-homelab-hardening.conf" ]] || {
+        [[ "${TEST_WRITE_TARGET}" == "${SSH_HARDENING_DROPIN}" ]] || {
             echo "FAIL ${CASE_NAME}: unexpected SSH drop-in target ${TEST_WRITE_TARGET}" >&2
+            exit 1
+        }
+        [[ ! -e "${SSH_LEGACY_HARDENING_DROPIN}" ]] || {
+            echo "FAIL ${CASE_NAME}: legacy managed SSH drop-in was not removed" >&2
             exit 1
         }
         grep -q "^PasswordAuthentication ${TEST_EXPECTED_PASSWORD}$" <<< "${TEST_DROPIN}" || {
@@ -78,8 +98,17 @@ run_alpine_apply_case() {
         set -euo pipefail
         source "${SCRIPT_PATH}"
 
-        TEST_DROPIN=""
+        temp_dir="$(mktemp -d)"
+        trap "rm -rf \"${temp_dir}\"" EXIT
+        mkdir -p "${temp_dir}/sshd_config.d"
 
+        TEST_DROPIN=""
+        TEST_WRITE_TARGET=""
+
+        SSHD_CONFIG_FILE="${temp_dir}/sshd_config"
+        SSHD_CONFIG_D_DIR="${temp_dir}/sshd_config.d"
+        SSH_HARDENING_DROPIN="${SSHD_CONFIG_D_DIR}/00-homelab-hardening.conf"
+        SSH_LEGACY_HARDENING_DROPIN="${SSHD_CONFIG_D_DIR}/99-homelab-hardening.conf"
         DISTRO="alpine"
         SSH_PORT="22"
         DISABLE_ROOT_SSH=1
@@ -90,23 +119,40 @@ run_alpine_apply_case() {
 
         log() { :; }
         warn() { :; }
+        backup_config() { :; }
         die() {
             echo "FAIL alpine apply: $*" >&2
             exit 1
         }
         ensure_sshd_include_dropin() { :; }
         write_file_with_backup() {
+            TEST_WRITE_TARGET="$1"
             TEST_DROPIN="$(cat)"
         }
         sshd_config_is_valid() { return 0; }
         sshd_effective_config() {
             printf "passwordauthentication yes\n"
             printf "kbdinteractiveauthentication no\n"
+            printf "permitrootlogin no\n"
+            printf "pubkeyauthentication yes\n"
         }
         enable_service_now() { return 0; }
 
+        cat > "${SSH_LEGACY_HARDENING_DROPIN}" <<EOF
+# Managed by homelab hardening script (old path)
+PasswordAuthentication no
+EOF
+
         apply_ssh_hardening
 
+        [[ "${TEST_WRITE_TARGET}" == "${SSH_HARDENING_DROPIN}" ]] || {
+            echo "FAIL alpine apply: unexpected SSH drop-in target ${TEST_WRITE_TARGET}" >&2
+            exit 1
+        }
+        [[ ! -e "${SSH_LEGACY_HARDENING_DROPIN}" ]] || {
+            echo "FAIL alpine apply: legacy managed SSH drop-in was not removed" >&2
+            exit 1
+        }
         grep -q "^PasswordAuthentication yes$" <<< "${TEST_DROPIN}" || {
             echo "FAIL alpine apply: PasswordAuthentication yes missing" >&2
             exit 1
@@ -144,6 +190,7 @@ run_effective_validation_case() {
 
         DISTRO="${TEST_DISTRO}"
         DISABLE_PASSWORD_SSH="${TEST_DISABLE_PASSWORD}"
+        DISABLE_ROOT_SSH=1
         TEST_WARNINGS=""
 
         warn() {
@@ -152,6 +199,8 @@ run_effective_validation_case() {
         sshd_effective_config() {
             printf "passwordauthentication %s\n" "${TEST_EFFECTIVE_PASSWORD}"
             printf "kbdinteractiveauthentication %s\n" "${TEST_EFFECTIVE_KBD}"
+            printf "permitrootlogin no\n"
+            printf "pubkeyauthentication yes\n"
             if [[ -n "${TEST_EFFECTIVE_USEPAM}" ]]; then
                 printf "usepam %s\n" "${TEST_EFFECTIVE_USEPAM}"
             fi
@@ -208,6 +257,52 @@ run_prompt_keep_passwords_case() {
     '
 }
 
+run_conflict_reporting_case() {
+    SCRIPT_PATH="${ROOT_DIR}/system_hardening.sh" bash -lc '
+        set -euo pipefail
+        source "${SCRIPT_PATH}"
+
+        temp_dir="$(mktemp -d)"
+        trap "rm -rf \"${temp_dir}\"" EXIT
+        mkdir -p "${temp_dir}/sshd_config.d"
+
+        SSHD_CONFIG_FILE="${temp_dir}/sshd_config"
+        SSHD_CONFIG_D_DIR="${temp_dir}/sshd_config.d"
+        DISABLE_PASSWORD_SSH=0
+        DISABLE_ROOT_SSH=1
+        DISTRO="ubuntu"
+        TEST_WARNINGS=""
+
+        cat > "${SSHD_CONFIG_FILE}" <<EOF
+Include ${SSHD_CONFIG_D_DIR}/*.conf
+EOF
+        cat > "${SSHD_CONFIG_D_DIR}/50-cloud-init.conf" <<EOF
+PasswordAuthentication no
+EOF
+
+        warn() {
+            TEST_WARNINGS+="$*;"
+        }
+        sshd_effective_config() {
+            printf "passwordauthentication no\n"
+            printf "kbdinteractiveauthentication no\n"
+            printf "permitrootlogin no\n"
+            printf "pubkeyauthentication yes\n"
+            printf "usepam yes\n"
+        }
+
+        if validate_ssh_hardening_effective; then
+            echo "FAIL conflict reporting: validation should fail when effective password auth is no but yes was requested" >&2
+            exit 1
+        fi
+        [[ "${TEST_WARNINGS}" == *"${SSHD_CONFIG_D_DIR}/50-cloud-init.conf:1:PasswordAuthentication no"* ]] || {
+            echo "FAIL conflict reporting: exact conflicting file/line was not reported" >&2
+            printf "%s\n" "${TEST_WARNINGS}" >&2
+            exit 1
+        }
+    '
+}
+
 run_debian_apply_case "debian-keep-passwords" "0" "yes"
 run_debian_apply_case "debian-disable-passwords" "1" "no"
 run_alpine_apply_case
@@ -215,5 +310,6 @@ run_effective_validation_case "effective-keep-passwords-ok" "ubuntu" "0" "yes" "
 run_effective_validation_case "effective-keep-passwords-blocked" "ubuntu" "0" "no" "no" "yes" "fail"
 run_effective_validation_case "effective-usepam-blocked" "ubuntu" "1" "no" "no" "no" "fail"
 run_prompt_keep_passwords_case
+run_conflict_reporting_case
 
 echo "SSH hardening config tests passed."
