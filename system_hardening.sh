@@ -18,6 +18,8 @@ SCRIPT_VERSION="3.4-modular"
 DISTRO=""
 DISTRO_VERSION=""
 DISTRO_CODENAME=""
+DISTRO_PRETTY_NAME=""
+DISTRO_ID_LIKE=""
 SSH_SERVICE=""
 CURRENT_SSH_PORT="22"
 
@@ -79,6 +81,11 @@ CHECKMK_EFFECTIVE_SOURCE="not-applicable"
 INSTALL_DOCKER=1
 DOCKER_OPEN_TLS_API=0
 DOCKER_EXTRA_PORTS=""
+DOCKER_VALIDATION_STATUS="not-run"
+DOCKER_VALIDATION_MESSAGE=""
+DOCKER_APT_KEYRING_DIR="${DOCKER_APT_KEYRING_DIR:-/etc/apt/keyrings}"
+DOCKER_APT_SOURCE_FILE="${DOCKER_APT_SOURCE_FILE:-/etc/apt/sources.list.d/docker.list}"
+OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 
 INSTALL_SAMBA=1
 ALLOW_SAMBA_PORTS=1
@@ -398,20 +405,52 @@ detect_ssh_port() {
     echo "22"
 }
 
+os_release_value() {
+    local key="$1"
+    local name=""
+    local value=""
+
+    [[ -r "${OS_RELEASE_FILE}" ]] || return 1
+
+    while IFS='=' read -r name value || [[ -n "${name}" ]]; do
+        [[ -n "${name}" && "${name}" != \#* ]] || continue
+        [[ "${name}" == "${key}" ]] || continue
+
+        value="${value%$'\r'}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+            value="${value:1:${#value}-2}"
+            value="${value//\\\"/\"}"
+            value="${value//\\\\/\\}"
+        elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+
+        echo "${value}"
+        return 0
+    done < "${OS_RELEASE_FILE}"
+
+    return 1
+}
+
 detect_environment() {
     # /etc/os-release is the canonical source for distro detection.
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        DISTRO="${ID:-unknown}"
-        DISTRO_VERSION="${VERSION_ID:-unknown}"
-        DISTRO_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+    if [[ -r "${OS_RELEASE_FILE}" ]]; then
+        DISTRO="$(os_release_value ID || echo "unknown")"
+        DISTRO_VERSION="$(os_release_value VERSION_ID || echo "unknown")"
+        DISTRO_CODENAME="$(os_release_value VERSION_CODENAME || true)"
+        if [[ -z "${DISTRO_CODENAME}" ]]; then
+            DISTRO_CODENAME="$(os_release_value UBUNTU_CODENAME || true)"
+        fi
+        DISTRO_PRETTY_NAME="$(os_release_value PRETTY_NAME || true)"
+        DISTRO_ID_LIKE="$(os_release_value ID_LIKE || true)"
     else
-        die "Cannot detect distribution (missing /etc/os-release)."
+        die "Cannot detect distribution (missing ${OS_RELEASE_FILE})."
     fi
 
     if [[ "${DISTRO}" != "ubuntu" && "${DISTRO}" != "debian" ]]; then
-        if [[ "${ID_LIKE:-}" == *"debian"* ]]; then
+        if [[ "${DISTRO_ID_LIKE}" == *"debian"* ]]; then
             DISTRO="debian-like"
         else
             die "This script supports Ubuntu and Debian only. Detected: ${DISTRO}"
@@ -428,7 +467,7 @@ detect_environment() {
     SSH_PORT="${CURRENT_SSH_PORT}"
 
     if [[ "${DISTRO}" == "debian-like" ]]; then
-        log "Detected distribution: ${PRETTY_NAME:-unknown} (treated as Debian family)"
+        log "Detected distribution: ${DISTRO_PRETTY_NAME:-unknown} (treated as Debian family)"
     else
         log "Detected distribution: ${DISTRO} ${DISTRO_VERSION}"
     fi
@@ -1063,7 +1102,7 @@ configure_profile_prompt() {
         docker-host)
             configure_profile_lan_scope_prompt "y"
 
-            if prompt_yes_no "Install Docker packages ('docker.io' and compose plugin)?" "y"; then
+            if prompt_yes_no "Install Docker Engine and Docker Compose v2 packages?" "y"; then
                 INSTALL_DOCKER=1
             else
                 INSTALL_DOCKER=0
@@ -1958,6 +1997,227 @@ install_queued_packages() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${PKG_QUEUE[@]}"
 }
 
+apt_package_available() {
+    local pkg="$1"
+    apt-cache show "${pkg}" >/dev/null 2>&1
+}
+
+ensure_docker_apt_prerequisites() {
+    local -a prereqs=(ca-certificates curl gnupg)
+
+    if apt_package_available "apt-transport-https"; then
+        prereqs+=("apt-transport-https")
+    else
+        log "apt-transport-https is unavailable or no longer required; skipping it."
+    fi
+
+    log "Installing Docker apt prerequisites: ${prereqs[*]}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${prereqs[@]}"; then
+        warn "Failed to install Docker apt prerequisites. Docker installation will be skipped."
+        return 1
+    fi
+}
+
+ensure_docker_apt_repo() {
+    local os_id=""
+    local codename=""
+    local arch=""
+    local key_file=""
+    local repo_line=""
+    local repo_already_configured=0
+
+    os_id="$(os_release_value ID || true)"
+    codename="$(os_release_value VERSION_CODENAME || true)"
+    if [[ -z "${codename}" ]]; then
+        codename="$(os_release_value UBUNTU_CODENAME || true)"
+    fi
+
+    if [[ "${os_id}" != "ubuntu" && "${os_id}" != "debian" ]]; then
+        warn "Docker official apt repository is only configured automatically for Ubuntu/Debian; detected ${os_id:-unknown}. Trying distro Docker packages instead."
+        return 1
+    fi
+
+    if [[ -z "${codename}" ]]; then
+        warn "Cannot determine Ubuntu/Debian codename from ${OS_RELEASE_FILE}; trying distro Docker packages instead."
+        return 1
+    fi
+
+    if ! arch="$(dpkg --print-architecture 2>/dev/null)"; then
+        warn "Cannot determine dpkg architecture for Docker repository; trying distro Docker packages instead."
+        return 1
+    fi
+
+    key_file="${DOCKER_APT_KEYRING_DIR}/docker.asc"
+    repo_line="deb [arch=${arch} signed-by=${key_file}] https://download.docker.com/linux/${os_id} ${codename} stable"
+    if [[ -f "${DOCKER_APT_SOURCE_FILE}" ]] && grep -Fxq "${repo_line}" "${DOCKER_APT_SOURCE_FILE}"; then
+        repo_already_configured=1
+    fi
+
+    if [[ "${repo_already_configured}" -eq 0 ]]; then
+        if ! curl -fsSL "https://download.docker.com/linux/${os_id}/dists/${codename}/Release" >/dev/null; then
+            warn "Docker official apt repository metadata is unavailable for ${os_id} ${codename}. Trying distro Docker packages instead."
+            return 1
+        fi
+    fi
+
+    mkdir -p "${DOCKER_APT_KEYRING_DIR}" "$(dirname "${DOCKER_APT_SOURCE_FILE}")"
+    chmod 0755 "${DOCKER_APT_KEYRING_DIR}" || true
+
+    if [[ ! -s "${key_file}" ]]; then
+        log "Adding Docker official GPG key to ${key_file}"
+        if ! curl -fsSL "https://download.docker.com/linux/${os_id}/gpg" -o "${key_file}"; then
+            warn "Failed to download Docker GPG key. Trying distro Docker packages instead."
+            return 1
+        fi
+    else
+        log "Docker official GPG key already present at ${key_file}"
+    fi
+    chmod a+r "${key_file}" || true
+
+    if [[ "${repo_already_configured}" -eq 1 ]]; then
+        log "Docker official apt repository already configured for ${os_id} ${codename}"
+    else
+        backup_config "${DOCKER_APT_SOURCE_FILE}"
+        printf '%s\n' "${repo_line}" > "${DOCKER_APT_SOURCE_FILE}"
+        log "Configured Docker official apt repository for ${os_id} ${codename}"
+    fi
+
+    if ! apt-get update; then
+        warn "apt-get update failed after configuring Docker repository. Trying distro Docker packages instead."
+        return 1
+    fi
+}
+
+select_docker_engine_packages() {
+    if apt_package_available "docker-ce" && \
+       apt_package_available "docker-ce-cli" && \
+       apt_package_available "containerd.io"; then
+        echo "docker-ce docker-ce-cli containerd.io"
+        return 0
+    fi
+
+    if apt_package_available "docker.io"; then
+        echo "docker.io"
+        return 0
+    fi
+
+    return 1
+}
+
+select_docker_compose_package() {
+    if apt_package_available "docker-compose-plugin"; then
+        echo "docker-compose-plugin"
+        return 0
+    fi
+
+    if apt_package_available "docker-compose-v2"; then
+        echo "docker-compose-v2"
+        return 0
+    fi
+
+    return 1
+}
+
+validate_docker_stack() {
+    local docker_version=""
+    local compose_version=""
+
+    if docker_version="$(docker --version 2>&1)"; then
+        log "Docker validation: ${docker_version}"
+    else
+        DOCKER_VALIDATION_STATUS="docker-missing"
+        DOCKER_VALIDATION_MESSAGE="Docker command is missing or not functional after package installation."
+        warn "${DOCKER_VALIDATION_MESSAGE}"
+        warn "Remediation: check apt-cache policy docker-ce docker.io, review ${LOGFILE}, then rerun this script or install Docker Engine manually from the official Docker repository."
+        return 1
+    fi
+
+    if compose_version="$(docker compose version 2>&1)"; then
+        DOCKER_VALIDATION_STATUS="ok"
+        DOCKER_VALIDATION_MESSAGE="${compose_version}"
+        log "Docker Compose validation: ${compose_version}"
+        return 0
+    fi
+
+    DOCKER_VALIDATION_STATUS="compose-missing"
+    DOCKER_VALIDATION_MESSAGE="Docker installed, but Docker Compose v2 is missing or not functional."
+    warn "${DOCKER_VALIDATION_MESSAGE}"
+    warn "Remediation: run 'apt-cache policy docker-compose-plugin docker-compose-v2' and install an available Compose v2 package. Avoid the legacy Python 'docker-compose' v1 package unless you explicitly require it."
+    return 1
+}
+
+install_docker_stack() {
+    local official_repo_ready=0
+    local engine_packages=""
+    local compose_package=""
+    local buildx_package=""
+    local -a docker_packages=()
+
+    DOCKER_VALIDATION_STATUS="not-run"
+    DOCKER_VALIDATION_MESSAGE=""
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        log "Docker and Docker Compose v2 already installed"
+        validate_docker_stack
+        return $?
+    fi
+
+    if ! ensure_docker_apt_prerequisites; then
+        DOCKER_VALIDATION_STATUS="docker-missing"
+        DOCKER_VALIDATION_MESSAGE="Docker apt prerequisites could not be installed."
+        return 1
+    fi
+
+    if ensure_docker_apt_repo; then
+        official_repo_ready=1
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        if engine_packages="$(select_docker_engine_packages)"; then
+            # shellcheck disable=SC2206
+            docker_packages+=(${engine_packages})
+        else
+            DOCKER_VALIDATION_STATUS="docker-missing"
+            DOCKER_VALIDATION_MESSAGE="No Docker Engine package was available from the configured apt repositories."
+            warn "${DOCKER_VALIDATION_MESSAGE}"
+            warn "Remediation: verify the OS codename (${DISTRO_CODENAME:-unknown}) is supported by Docker, run 'apt-cache policy docker-ce docker.io', then rerun this script."
+            return 1
+        fi
+    fi
+
+    if apt_package_available "docker-buildx-plugin"; then
+        buildx_package="docker-buildx-plugin"
+        docker_packages+=("${buildx_package}")
+    elif [[ "${official_repo_ready}" -eq 1 ]]; then
+        warn "Optional docker-buildx-plugin package is unavailable; continuing without Buildx."
+    fi
+
+    if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+        if compose_package="$(select_docker_compose_package)"; then
+            if [[ "${compose_package}" == "docker-compose-v2" ]]; then
+                warn "Docker Compose v2 package docker-compose-plugin is unavailable from the configured apt repositories; using distro fallback docker-compose-v2."
+            fi
+            docker_packages+=("${compose_package}")
+        else
+            warn "Docker Compose v2 package docker-compose-plugin is unavailable, and no docker-compose-v2 fallback package was available. Docker Engine will still be installed when possible."
+        fi
+    fi
+
+    if (( ${#docker_packages[@]} > 0 )); then
+        log "Installing Docker packages: ${docker_packages[*]}"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${docker_packages[@]}"; then
+            DOCKER_VALIDATION_STATUS="docker-missing"
+            DOCKER_VALIDATION_MESSAGE="Docker package installation failed. See ${LOGFILE} for apt output."
+            warn "${DOCKER_VALIDATION_MESSAGE}"
+            return 1
+        fi
+    else
+        log "No Docker packages needed after availability checks."
+    fi
+
+    validate_docker_stack
+}
+
 prepare_package_queue() {
     # Package queue is deduplicated so reruns do not cause noisy repeat installs.
     queue_package "openssh-server"
@@ -1987,8 +2247,7 @@ prepare_package_queue() {
     case "${PROFILE}" in
         docker-host)
             if [[ "${INSTALL_DOCKER}" -eq 1 ]]; then
-                queue_package "docker.io"
-                queue_package "docker-compose-plugin"
+                queue_package "gnupg"
             fi
             ;;
         file-server)
@@ -2610,6 +2869,11 @@ apply_all_changes() {
 
     run_cmd apt-get update
     install_queued_packages
+    if [[ "${PROFILE}" == "docker-host" && "${INSTALL_DOCKER}" -eq 1 ]]; then
+        if ! install_docker_stack; then
+            warn "Docker stack setup completed with warnings. Review the Docker validation messages above before installing container workloads."
+        fi
+    fi
 
     apply_access_accounts
     apply_ssh_hardening
@@ -2649,6 +2913,23 @@ print_post_apply() {
     fi
     if [[ "${INSTALL_CHECKMK}" -eq 1 && "${CHECKMK_COMM_MODE}" == "tls" ]]; then
         echo "${next_step}) Complete Checkmk TLS registration (cmk-agent-ctl register)."
+        next_step="$((next_step + 1))"
+    fi
+    if [[ "${PROFILE}" == "docker-host" && "${INSTALL_DOCKER}" -eq 1 ]]; then
+        case "${DOCKER_VALIDATION_STATUS}" in
+            ok)
+                echo "${next_step}) Docker ready: run 'docker --version' and 'docker compose version' to verify locally."
+                ;;
+            compose-missing)
+                echo "${next_step}) Docker installed, but Compose v2 is missing. Run: apt-cache policy docker-compose-plugin docker-compose-v2"
+                ;;
+            docker-missing)
+                echo "${next_step}) Docker was requested but did not validate. Review ${LOGFILE} and check: apt-cache policy docker-ce docker.io"
+                ;;
+            *)
+                echo "${next_step}) Docker validation was not run. Check: docker --version && docker compose version"
+                ;;
+        esac
     fi
     echo "======================================================"
 }
