@@ -9,25 +9,36 @@ CONFIG_DIR="${APP_DIR}/config"
 BACKUP_DIR="${APP_DIR}/backups"
 LOG_DIR="/var/log/litellm-gateway"
 ENV_FILE="${APP_DIR}/.env"
+GATEWAY_ENV_FILE="${APP_DIR}/gateway.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 EGRESS_ALLOWLIST="${APP_DIR}/egress-allowlist.txt"
-DEFAULT_LITELLM_IMAGE="ghcr.io/berriai/litellm-non_root:v1.83.0-stable"
+
+DEFAULT_LITELLM_IMAGE="ghcr.io/berriai/litellm-non_root:v1.83.3-stable.patch.2"
+PREVIOUS_INVALID_LITELLM_DEFAULT_IMAGE="ghcr.io/berriai/litellm-non_root:v1.83.0-stable"
 DEFAULT_POSTGRES_IMAGE="postgres:16-bookworm"
 LITELLM_IMAGE="${LITELLM_IMAGE:-$DEFAULT_LITELLM_IMAGE}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-$DEFAULT_POSTGRES_IMAGE}"
 COSIGN_KEY_URL="${COSIGN_KEY_URL:-https://raw.githubusercontent.com/BerriAI/litellm/0112e53046018d726492c814b3644b7d376029d0/cosign.pub}"
 COSIGN_VERSION="${COSIGN_VERSION:-3.0.6}"
+
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
-LITELLM_PORT="${LITELLM_PORT:-4000}"
 LITELLM_CONTAINER_PORT="4000"
-TRUSTED_CIDR="${TRUSTED_CIDR:-}"
-LITELLM_READ_ONLY="${LITELLM_READ_ONLY:-true}"
+LITELLM_HOST_IP="${LITELLM_HOST_IP:-}"
+LITELLM_PORT="${LITELLM_PORT:-}"
+TRUSTED_CLIENT_CIDR="${TRUSTED_CLIENT_CIDR:-${TRUSTED_CIDR:-}}"
+OLLAMA_BRIDGE_API_BASE="${OLLAMA_BRIDGE_API_BASE:-}"
+DOCKER_LITELLM_SUBNET="${DOCKER_LITELLM_SUBNET:-}"
+OLLAMA_HOST_BIND="${OLLAMA_HOST_BIND:-0.0.0.0:11434}"
+ZEROCLAW_HOST_IP="${ZEROCLAW_HOST_IP:-}"
+LITELLM_READ_ONLY="false"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-litellm-gateway}"
+
 FORCE=0
 SKIP_COSIGN=0
 STRICT_EGRESS=0
-
+YES=0
+OPENROUTER_CONFIGURED=0
 LOGFILE=""
 
 on_error() {
@@ -60,19 +71,35 @@ die() {
   exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "${SCRIPT_DIR}/litellm-sanity-lib.sh" ]; then
+  # shellcheck disable=SC1091
+  . "${SCRIPT_DIR}/litellm-sanity-lib.sh"
+else
+  warn "litellm-sanity-lib.sh not found; account sanity checks will be limited."
+fi
+
 usage() {
   cat <<'EOF'
 Usage: setup-litellm-gateway.sh [options]
 
 Options:
-  --force                 Allow unsupported OS after warning.
-  --skip-cosign           Lab debugging only; requires typing I_ACCEPT_SUPPLY_CHAIN_RISK.
-  --strict-egress         Generate a stricter egress allowlist and router firewall plan.
-  --image IMAGE           Override LITELLM_IMAGE.
-  --bind-addr ADDR        Host bind address. Default: 0.0.0.0.
-  --port PORT             Host LiteLLM port. Default: 4000.
-  --trusted-cidr CIDR     CIDR allowed to reach LiteLLM. Default prompt: 172.16.172.0/24.
-  -h, --help              Show this help.
+  --force                         Allow unsupported OS after warning.
+  --skip-cosign                   Lab debugging only; requires typing I_ACCEPT_SUPPLY_CHAIN_RISK.
+  --strict-egress                 Generate a stricter egress allowlist and router firewall plan.
+  --image IMAGE                   Override LITELLM_IMAGE.
+  --bind-addr ADDR                Host bind address for Docker publish. Default: 0.0.0.0.
+  --litellm-host-ip IP            LAN/Tailscale IP clients should use for LiteLLM.
+  --litellm-port PORT             Host LiteLLM port. Default prompt value: 4000.
+  --port PORT                     Legacy alias for --litellm-port.
+  --trusted-client-cidr CIDR      CIDR or single-client /32 allowed to reach LiteLLM.
+  --trusted-cidr CIDR             Legacy alias for --trusted-client-cidr.
+  --ollama-bridge-api-base URL    URL LiteLLM containers use for host Ollama.
+  --docker-litellm-subnet CIDR    Docker subnet allowed to reach host Ollama.
+  --ollama-host-bind HOST:PORT    Ollama service bind. Default: 0.0.0.0:11434.
+  --zeroclaw-host-ip IP           Optional ZeroClaw host IP for saved examples/tests.
+  --yes                           Accept detected/default non-secret network values.
+  -h, --help                      Show this help.
 
 This installer is Docker-only and refuses LiteLLM "latest", nightly, dev, and
 main-latest image tags. It never installs LiteLLM from PyPI.
@@ -85,6 +112,7 @@ parse_args() {
       --force) FORCE=1 ;;
       --skip-cosign) SKIP_COSIGN=1 ;;
       --strict-egress) STRICT_EGRESS=1 ;;
+      --yes) YES=1 ;;
       --image)
         shift
         [ "$#" -gt 0 ] || die "--image requires a value"
@@ -95,15 +123,40 @@ parse_args() {
         [ "$#" -gt 0 ] || die "--bind-addr requires a value"
         BIND_ADDR="$1"
         ;;
-      --port)
+      --litellm-host-ip)
         shift
-        [ "$#" -gt 0 ] || die "--port requires a value"
+        [ "$#" -gt 0 ] || die "--litellm-host-ip requires a value"
+        LITELLM_HOST_IP="$1"
+        ;;
+      --litellm-port|--port)
+        shift
+        [ "$#" -gt 0 ] || die "--litellm-port requires a value"
         LITELLM_PORT="$1"
         ;;
-      --trusted-cidr)
+      --trusted-client-cidr|--trusted-cidr)
         shift
-        [ "$#" -gt 0 ] || die "--trusted-cidr requires a value"
-        TRUSTED_CIDR="$1"
+        [ "$#" -gt 0 ] || die "--trusted-client-cidr requires a value"
+        TRUSTED_CLIENT_CIDR="$1"
+        ;;
+      --ollama-bridge-api-base)
+        shift
+        [ "$#" -gt 0 ] || die "--ollama-bridge-api-base requires a value"
+        OLLAMA_BRIDGE_API_BASE="$1"
+        ;;
+      --docker-litellm-subnet)
+        shift
+        [ "$#" -gt 0 ] || die "--docker-litellm-subnet requires a value"
+        DOCKER_LITELLM_SUBNET="$1"
+        ;;
+      --ollama-host-bind)
+        shift
+        [ "$#" -gt 0 ] || die "--ollama-host-bind requires a value"
+        OLLAMA_HOST_BIND="$1"
+        ;;
+      --zeroclaw-host-ip)
+        shift
+        [ "$#" -gt 0 ] || die "--zeroclaw-host-ip requires a value"
+        ZEROCLAW_HOST_IP="$1"
         ;;
       -h|--help)
         usage
@@ -348,10 +401,11 @@ backup_existing_file() {
   log "Backed up existing ${path} to ${path}.bak.${stamp}"
 }
 
-get_env_value() {
-  local key="$1"
+get_file_value() {
+  local file="$1"
+  local key="$2"
   local value
-  [ -f "$ENV_FILE" ] || return 0
+  [ -f "$file" ] || return 0
   value="$(awk -F= -v key="$key" '
     /^[[:space:]]*#/ || $0 !~ /=/ { next }
     {
@@ -364,7 +418,7 @@ get_env_value() {
         exit
       }
     }
-  ' "$ENV_FILE")"
+  ' "$file")"
   value="${value%$'\r'}"
   case "$value" in
     \"*\") value="${value#\"}"; value="${value%\"}" ;;
@@ -373,43 +427,157 @@ get_env_value() {
   printf '%s\n' "$value"
 }
 
+get_env_value() {
+  get_file_value "$ENV_FILE" "$1"
+}
+
+get_gateway_value() {
+  get_file_value "$GATEWAY_ENV_FILE" "$1"
+}
+
 apply_existing_settings() {
   local existing
 
   existing="$(get_env_value LITELLM_IMAGE)"
+  [ -n "$existing" ] || existing="$(get_gateway_value LITELLM_IMAGE)"
   if [ -n "$existing" ] && [ "$LITELLM_IMAGE" = "$DEFAULT_LITELLM_IMAGE" ]; then
-    LITELLM_IMAGE="$existing"
+    if [ "$existing" = "$PREVIOUS_INVALID_LITELLM_DEFAULT_IMAGE" ]; then
+      warn "Replacing previous generated LiteLLM default image tag with ${DEFAULT_LITELLM_IMAGE}."
+    else
+      LITELLM_IMAGE="$existing"
+    fi
   fi
 
   existing="$(get_env_value POSTGRES_IMAGE)"
+  [ -n "$existing" ] || existing="$(get_gateway_value POSTGRES_IMAGE)"
   if [ -n "$existing" ] && [ "$POSTGRES_IMAGE" = "$DEFAULT_POSTGRES_IMAGE" ]; then
     POSTGRES_IMAGE="$existing"
   fi
 
-  existing="$(get_env_value BIND_ADDR)"
+  existing="$(get_gateway_value COMPOSE_PROJECT_NAME)"
+  [ -n "$existing" ] || existing="$(get_env_value COMPOSE_PROJECT_NAME)"
+  if [ -n "$existing" ] && [ "$COMPOSE_PROJECT_NAME" = "litellm-gateway" ]; then
+    COMPOSE_PROJECT_NAME="$existing"
+  fi
+
+  existing="$(get_gateway_value BIND_ADDR)"
+  [ -n "$existing" ] || existing="$(get_env_value BIND_ADDR)"
   if [ -n "$existing" ] && [ "$BIND_ADDR" = "0.0.0.0" ]; then
     BIND_ADDR="$existing"
   fi
 
-  existing="$(get_env_value LITELLM_PORT)"
-  if [ -n "$existing" ] && [ "$LITELLM_PORT" = "4000" ]; then
+  existing="$(get_gateway_value LITELLM_HOST_IP)"
+  if [ -n "$existing" ] && [ -z "$LITELLM_HOST_IP" ]; then
+    LITELLM_HOST_IP="$existing"
+  fi
+
+  existing="$(get_gateway_value LITELLM_PORT)"
+  [ -n "$existing" ] || existing="$(get_env_value LITELLM_PORT)"
+  if [ -n "$existing" ] && [ -z "$LITELLM_PORT" ]; then
     LITELLM_PORT="$existing"
   fi
 
-  existing="$(get_env_value TRUSTED_CIDR)"
-  if [ -n "$existing" ] && [ -z "$TRUSTED_CIDR" ]; then
-    TRUSTED_CIDR="$existing"
+  existing="$(get_gateway_value TRUSTED_CLIENT_CIDR)"
+  [ -n "$existing" ] || existing="$(get_env_value TRUSTED_CLIENT_CIDR)"
+  [ -n "$existing" ] || existing="$(get_env_value TRUSTED_CIDR)"
+  if [ -n "$existing" ] && [ -z "$TRUSTED_CLIENT_CIDR" ]; then
+    TRUSTED_CLIENT_CIDR="$existing"
   fi
 
-  existing="$(get_env_value LITELLM_READ_ONLY)"
-  if [ -n "$existing" ] && [ "$LITELLM_READ_ONLY" = "true" ]; then
-    LITELLM_READ_ONLY="$existing"
+  existing="$(get_gateway_value OLLAMA_BRIDGE_API_BASE)"
+  if [ -n "$existing" ] && [ -z "$OLLAMA_BRIDGE_API_BASE" ]; then
+    OLLAMA_BRIDGE_API_BASE="$existing"
   fi
 
-  existing="$(get_env_value COMPOSE_PROJECT_NAME)"
-  if [ -n "$existing" ] && [ "$COMPOSE_PROJECT_NAME" = "litellm-gateway" ]; then
-    COMPOSE_PROJECT_NAME="$existing"
+  existing="$(get_gateway_value DOCKER_LITELLM_SUBNET)"
+  if [ -n "$existing" ] && [ -z "$DOCKER_LITELLM_SUBNET" ]; then
+    DOCKER_LITELLM_SUBNET="$existing"
   fi
+
+  existing="$(get_gateway_value OLLAMA_HOST_BIND)"
+  if [ -n "$existing" ] && [ "$OLLAMA_HOST_BIND" = "0.0.0.0:11434" ]; then
+    OLLAMA_HOST_BIND="$existing"
+  fi
+
+  existing="$(get_gateway_value ZEROCLAW_HOST_IP)"
+  if [ -n "$existing" ] && [ -z "$ZEROCLAW_HOST_IP" ]; then
+    ZEROCLAW_HOST_IP="$existing"
+  fi
+}
+
+detect_primary_ip() {
+  hostname -I 2>/dev/null | awk '{print $1}' || true
+}
+
+docker_network_name() {
+  printf '%s_litellm_internal\n' "$COMPOSE_PROJECT_NAME"
+}
+
+detect_docker_gateway() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker network inspect "$(docker_network_name)" --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true
+}
+
+detect_docker_subnet() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker network inspect "$(docker_network_name)" --format '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true
+}
+
+prompt_value() {
+  local var_name="$1"
+  local prompt="$2"
+  local default="${3:-}"
+  local required="${4:-required}"
+  local current="${!var_name:-}"
+  local entered
+
+  if [ -n "$current" ]; then
+    return 0
+  fi
+
+  if [ "$YES" -eq 1 ]; then
+    entered="$default"
+  elif [ -t 0 ]; then
+    if [ -n "$default" ]; then
+      read -r -p "${prompt} [${default}]: " entered
+      entered="${entered:-$default}"
+    else
+      read -r -p "${prompt}: " entered
+    fi
+  else
+    entered="$default"
+  fi
+
+  if [ -z "$entered" ] && [ "$required" = "required" ]; then
+    die "Missing required value for ${var_name}. Pass the matching flag or set ${var_name}."
+  fi
+
+  printf -v "$var_name" '%s' "$entered"
+}
+
+collect_network_settings() {
+  local detected_ip
+  local detected_gateway
+  local detected_subnet
+
+  detected_ip="$(detect_primary_ip)"
+  prompt_value LITELLM_HOST_IP "Enter LiteLLM gateway LAN/Tailscale IP clients should use" "$detected_ip" required
+  prompt_value LITELLM_PORT "Enter LiteLLM host port clients should use" "4000" required
+  prompt_value TRUSTED_CLIENT_CIDR "Enter trusted client CIDR allowed to access LiteLLM port ${LITELLM_PORT}" "" required
+
+  detected_gateway="$(detect_docker_gateway)"
+  if [ -z "$OLLAMA_BRIDGE_API_BASE" ] && [ -n "$detected_gateway" ]; then
+    OLLAMA_BRIDGE_API_BASE="http://${detected_gateway}:11434"
+  fi
+  prompt_value OLLAMA_BRIDGE_API_BASE "Enter Ollama bridge API base reachable from the LiteLLM container" "$OLLAMA_BRIDGE_API_BASE" required
+
+  detected_subnet="$(detect_docker_subnet)"
+  if [ -z "$DOCKER_LITELLM_SUBNET" ] && [ -n "$detected_subnet" ]; then
+    DOCKER_LITELLM_SUBNET="$detected_subnet"
+  fi
+  prompt_value DOCKER_LITELLM_SUBNET "Enter Docker subnet allowed to reach the host Ollama daemon" "$DOCKER_LITELLM_SUBNET" required
+
+  prompt_value ZEROCLAW_HOST_IP "Enter ZeroClaw host IP or leave blank to skip ZeroClaw-specific tests" "" optional
 }
 
 secret_or_generate() {
@@ -428,6 +596,7 @@ secret_or_generate() {
 
 prompt_openrouter_key_if_missing() {
   local current="${OPENROUTER_API_KEY:-}"
+  local entered
   if [ -z "$current" ]; then
     current="$(get_env_value OPENROUTER_API_KEY)"
   fi
@@ -436,29 +605,22 @@ prompt_openrouter_key_if_missing() {
     return
   fi
 
-  printf 'Enter dedicated low-budget OPENROUTER_API_KEY for this gateway: ' >&2
-  local entered
+  if [ "$YES" -eq 1 ] || [ ! -t 0 ]; then
+    printf '%s\n' ""
+    return
+  fi
+
+  printf 'Enter optional dedicated low-budget OPENROUTER_API_KEY, or leave blank to skip OpenRouter: ' >&2
   IFS= read -r -s entered
   printf '\n' >&2
-  [ -n "$entered" ] || die "OPENROUTER_API_KEY is required for the default OpenRouter route."
   printf '%s\n' "$entered"
 }
 
-write_env_file() {
+write_secret_env_file() {
   local postgres_password
   local master_key
   local salt_key
   local openrouter_key
-  local trusted
-  local existing_trusted
-
-  existing_trusted="$(get_env_value TRUSTED_CIDR)"
-  trusted="${TRUSTED_CIDR:-$existing_trusted}"
-  if [ -z "$trusted" ]; then
-    read -r -p "Trusted CIDR allowed to reach LiteLLM [172.16.172.0/24]: " trusted
-    trusted="${trusted:-172.16.172.0/24}"
-  fi
-  TRUSTED_CIDR="$trusted"
 
   postgres_password="$(secret_or_generate POSTGRES_PASSWORD)"
   master_key="$(secret_or_generate LITELLM_MASTER_KEY "sk-")"
@@ -466,9 +628,14 @@ write_env_file() {
   openrouter_key="$(prompt_openrouter_key_if_missing)"
 
   [[ "$master_key" == sk-* ]] || die "LITELLM_MASTER_KEY must start with sk-."
+  if [ -n "$openrouter_key" ]; then
+    OPENROUTER_CONFIGURED=1
+  else
+    OPENROUTER_CONFIGURED=0
+  fi
 
   backup_existing_file "$ENV_FILE"
-  log "Writing secret environment file: $ENV_FILE"
+  log "Writing protected secret environment file: $ENV_FILE"
   cat > "$ENV_FILE" <<EOF
 # Managed by setup-litellm-gateway.sh.
 # Sensitive: provider keys, LiteLLM keys, and database password.
@@ -479,16 +646,32 @@ DATABASE_URL=postgresql://litellm:${postgres_password}@postgres:5432/litellm
 LITELLM_MASTER_KEY=${master_key}
 LITELLM_SALT_KEY=${salt_key}
 OPENROUTER_API_KEY=${openrouter_key}
-BIND_ADDR=${BIND_ADDR}
-LITELLM_PORT=${LITELLM_PORT}
-TRUSTED_CIDR=${TRUSTED_CIDR}
-LITELLM_IMAGE=${LITELLM_IMAGE}
-POSTGRES_IMAGE=${POSTGRES_IMAGE}
-LITELLM_READ_ONLY=${LITELLM_READ_ONLY}
-COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
 EOF
   chown root:litellm-gateway "$ENV_FILE"
   chmod 0600 "$ENV_FILE"
+}
+
+write_gateway_env_file() {
+  backup_existing_file "$GATEWAY_ENV_FILE"
+  log "Writing non-secret gateway network environment file: $GATEWAY_ENV_FILE"
+  cat > "$GATEWAY_ENV_FILE" <<EOF
+# Managed by setup-litellm-gateway.sh.
+# Non-secret deployment-specific network and image settings.
+LITELLM_HOST_IP=${LITELLM_HOST_IP}
+LITELLM_PORT=${LITELLM_PORT}
+TRUSTED_CLIENT_CIDR=${TRUSTED_CLIENT_CIDR}
+OLLAMA_BRIDGE_API_BASE=${OLLAMA_BRIDGE_API_BASE}
+DOCKER_LITELLM_SUBNET=${DOCKER_LITELLM_SUBNET}
+OLLAMA_HOST_BIND=${OLLAMA_HOST_BIND}
+ZEROCLAW_HOST_IP=${ZEROCLAW_HOST_IP}
+BIND_ADDR=${BIND_ADDR}
+COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
+LITELLM_IMAGE=${LITELLM_IMAGE}
+POSTGRES_IMAGE=${POSTGRES_IMAGE}
+LITELLM_READ_ONLY=${LITELLM_READ_ONLY}
+EOF
+  chown root:litellm-gateway "$GATEWAY_ENV_FILE"
+  chmod 0640 "$GATEWAY_ENV_FILE"
 }
 
 confirm_skip_cosign() {
@@ -535,13 +718,72 @@ pull_and_resolve_digest() {
 
 write_litellm_config() {
   backup_existing_file "$CONFIG_FILE"
-  log "Writing LiteLLM config: $CONFIG_FILE"
-  cat > "$CONFIG_FILE" <<'EOF'
+  log "Writing LiteLLM config with selected Ollama bridge base: $CONFIG_FILE"
+  cat > "$CONFIG_FILE" <<EOF
 model_list:
+  - model_name: ollama-gpt-oss-cloud
+    litellm_params:
+      model: ollama/gpt-oss:120b-cloud
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+
+  - model_name: ollama-kimi-k26-cloud
+    litellm_params:
+      model: ollama/kimi-k2.6:cloud
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+
+  - model_name: ollama-glm-51-cloud
+    litellm_params:
+      model: ollama/glm-5.1:cloud
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+
+  - model_name: ollama-deepseek-v4-pro-cloud
+    litellm_params:
+      model: ollama/deepseek-v4-pro:cloud
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+
+  - model_name: ollama-gemma4-31b-cloud
+    litellm_params:
+      model: ollama/gemma4:31b-cloud
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+
+  - model_name: ollama-nemotron-3-super-cloud
+    litellm_params:
+      model: ollama/nemotron-3-super:cloud
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+
+  - model_name: embed-nomic
+    litellm_params:
+      model: ollama/nomic-embed-text
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+    model_info:
+      mode: embedding
+
+  - model_name: embed-embeddinggemma
+    litellm_params:
+      model: ollama/embeddinggemma
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+    model_info:
+      mode: embedding
+
+  - model_name: embed-qwen3
+    litellm_params:
+      model: ollama/qwen3-embedding
+      api_base: "${OLLAMA_BRIDGE_API_BASE}"
+    model_info:
+      mode: embedding
+EOF
+
+  if [ "$OPENROUTER_CONFIGURED" -eq 1 ]; then
+    cat >> "$CONFIG_FILE" <<'EOF'
+
   - model_name: openrouter-auto
     litellm_params:
       model: openrouter/openrouter/auto
       api_key: os.environ/OPENROUTER_API_KEY
+EOF
+  fi
+
+  cat >> "$CONFIG_FILE" <<'EOF'
 
 litellm_settings:
   set_verbose: false
@@ -622,12 +864,6 @@ align_config_permissions_for_image() {
 write_compose_file() {
   local litellm_digest="$1"
   local postgres_digest="$2"
-  local read_only="$LITELLM_READ_ONLY"
-
-  case "$read_only" in
-    true|false) ;;
-    *) die "LITELLM_READ_ONLY must be true or false." ;;
-  esac
 
   backup_existing_file "$COMPOSE_FILE"
   log "Writing digest-pinned compose file: $COMPOSE_FILE"
@@ -636,8 +872,10 @@ services:
   litellm:
     image: ${litellm_digest}
     restart: unless-stopped
+    init: true
     env_file:
       - .env
+      - gateway.env
     command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "${LITELLM_CONTAINER_PORT}"]
     ports:
       - "${BIND_ADDR}:${LITELLM_PORT}:${LITELLM_CONTAINER_PORT}"
@@ -653,13 +891,13 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    read_only: ${read_only}
+    read_only: false
     tmpfs:
       - /tmp:size=128m,mode=1777
     pids_limit: 256
-    mem_limit: 1g
+    mem_limit: 2g
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${LITELLM_CONTAINER_PORT}/health', timeout=5)\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${LITELLM_CONTAINER_PORT}/health/liveliness', timeout=5)\""]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -713,11 +951,11 @@ detect_ssh_port() {
 configure_ufw() {
   local ssh_port
   ssh_port="$(detect_ssh_port)"
-  log "Configuring UFW: allow SSH ${ssh_port}/tcp and LiteLLM ${LITELLM_PORT}/tcp from ${TRUSTED_CIDR}"
+  log "Configuring UFW: allow SSH ${ssh_port}/tcp and LiteLLM ${LITELLM_PORT}/tcp from ${TRUSTED_CLIENT_CIDR}"
   ufw default deny incoming >/dev/null || warn "Unable to set UFW default deny incoming."
   ufw default allow outgoing >/dev/null || warn "Unable to set UFW default allow outgoing."
   ufw allow "${ssh_port}/tcp" comment "preserve SSH access" >/dev/null || warn "Unable to add SSH UFW rule."
-  ufw allow from "$TRUSTED_CIDR" to any port "$LITELLM_PORT" proto tcp comment "LiteLLM gateway trusted CIDR" >/dev/null || warn "Unable to add LiteLLM UFW rule."
+  ufw allow from "$TRUSTED_CLIENT_CIDR" to any port "$LITELLM_PORT" proto tcp comment "LiteLLM gateway trusted clients" >/dev/null || warn "Unable to add LiteLLM UFW rule."
   ufw --force enable
   ufw status verbose | tee -a "$LOGFILE"
 }
@@ -734,8 +972,8 @@ iptables -N DOCKER-USER 2>/dev/null || true
 while rule_num=\$(iptables -L DOCKER-USER --line-numbers 2>/dev/null | awk '/litellm-gateway/ {print \$1; exit}'); [ -n "\${rule_num}" ]; do
   iptables -D DOCKER-USER "\${rule_num}"
 done
-iptables -I DOCKER-USER 1 -p tcp --dport ${LITELLM_CONTAINER_PORT} -s ${TRUSTED_CIDR} -m comment --comment "litellm-gateway allow trusted" -j RETURN
-iptables -I DOCKER-USER 2 -p tcp --dport ${LITELLM_CONTAINER_PORT} -m comment --comment "litellm-gateway deny untrusted" -j DROP
+iptables -I DOCKER-USER 1 -p tcp --dport ${LITELLM_CONTAINER_PORT} -s ${TRUSTED_CLIENT_CIDR} -m comment --comment "litellm-gateway allow trusted clients" -j RETURN
+iptables -I DOCKER-USER 2 -p tcp --dport ${LITELLM_CONTAINER_PORT} -m comment --comment "litellm-gateway deny untrusted clients" -j DROP
 EOF
   chmod 0755 "$helper"
 
@@ -766,14 +1004,15 @@ write_egress_allowlist() {
 # Default mode is monitor/document-only.
 #
 # Provider/API domains commonly needed:
+ollama.com
 openrouter.ai
 api.openai.com
 api.anthropic.com
 generativelanguage.googleapis.com
 
-# Future local model endpoints:
-# 172.16.172.50:11434  # Ollama
-# 172.16.172.60:8000   # vLLM OpenAI-compatible API
+# Local model endpoints should be deployment-specific:
+# <OLLAMA_BRIDGE_API_BASE>  # Host Ollama bridge reachable from the LiteLLM container
+# <LOCAL_VLLM_URL>          # vLLM OpenAI-compatible API, if used
 EOF
   chmod 0640 "$EGRESS_ALLOWLIST"
 
@@ -794,11 +1033,12 @@ Recommended policy:
 1. Put this VM in a dedicated VLAN or firewall group.
 2. Allow DNS only to your resolver.
 3. Allow TCP 443 from this VM to provider address groups resolved from:
+   - ollama.com
    - openrouter.ai
    - api.openai.com
    - api.anthropic.com
    - generativelanguage.googleapis.com
-4. Allow local Ollama/vLLM IPs explicitly.
+4. Allow local Ollama/vLLM destinations explicitly.
 5. Deny all other outbound internet from this VM.
 
 Refresh cadence: at least daily, and before provider changes.
@@ -812,20 +1052,36 @@ start_gateway() {
   (cd "$APP_DIR" && docker compose -p "$COMPOSE_PROJECT_NAME" up -d)
 }
 
+refresh_detected_docker_network_settings() {
+  local detected_gateway
+  local detected_subnet
+  detected_gateway="$(detect_docker_gateway)"
+  detected_subnet="$(detect_docker_subnet)"
+  if [ -n "$detected_subnet" ] && [ "$detected_subnet" != "$DOCKER_LITELLM_SUBNET" ]; then
+    warn "Docker network subnet is ${detected_subnet}, but gateway.env has ${DOCKER_LITELLM_SUBNET}. Keeping the saved value; update gateway.env if the bridge firewall should use the detected subnet."
+  fi
+  if [ -n "$detected_gateway" ]; then
+    log "Detected Docker network gateway after startup: ${detected_gateway}"
+  fi
+}
+
 print_next_steps() {
-  local vm_ip
-  vm_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   cat <<EOF
 
 LiteLLM Gateway setup complete.
 
-Endpoint:
-  http://${vm_ip:-<vm-ip>}:${LITELLM_PORT}/v1
+Client endpoint:
+  http://${LITELLM_HOST_IP}:${LITELLM_PORT}/v1
+
+Saved non-secret network settings:
+  ${GATEWAY_ENV_FILE}
 
 Next checks:
   sudo ${APP_DIR}/verify-litellm-gateway.sh
-  sudo ufw status verbose
+  sudo ${APP_DIR}/configure-ollama-cloud-bridge.sh
+  sudo ${APP_DIR}/verify-ollama-cloud-bridge.sh
   sudo docker compose -p ${COMPOSE_PROJECT_NAME} -f ${COMPOSE_FILE} ps
+  sudo ufw status verbose
 
 Create per-app virtual keys before pointing ZeroClaw/OpenClaw/NemoClaw at this gateway.
 EOF
@@ -833,18 +1089,34 @@ EOF
 
 copy_helper_scripts() {
   local repo_script_dir
+  local helper
   repo_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  install -m 0750 -o root -g litellm-gateway "${repo_script_dir}/verify-litellm-gateway.sh" "${APP_DIR}/verify-litellm-gateway.sh"
-  install -m 0750 -o root -g litellm-gateway "${repo_script_dir}/update-litellm-gateway.sh" "${APP_DIR}/update-litellm-gateway.sh"
-  install -m 0750 -o root -g litellm-gateway "${repo_script_dir}/backup-litellm-gateway.sh" "${APP_DIR}/backup-litellm-gateway.sh"
+  for helper in \
+    verify-litellm-gateway.sh \
+    update-litellm-gateway.sh \
+    backup-litellm-gateway.sh \
+    configure-ollama-cloud-bridge.sh \
+    verify-ollama-cloud-bridge.sh \
+    create-litellm-client-key.sh; do
+    if [ -f "${repo_script_dir}/${helper}" ]; then
+      install -m 0750 -o root -g litellm-gateway "${repo_script_dir}/${helper}" "${APP_DIR}/${helper}"
+    fi
+  done
 }
 
 main() {
   parse_args "$@"
   require_root
   setup_logging
+  if declare -F sanity_host_banner >/dev/null 2>&1; then
+    sanity_host_banner "LiteLLM setup host" "$APP_DIR" "$COMPOSE_FILE"
+    sanity_ollama_identity_check
+    sanity_env_report "$ENV_FILE"
+    sanity_database_url_password_check "$ENV_FILE" "$REPAIR_DATABASE_URL"
+  fi
   detect_os
   apply_existing_settings
+  collect_network_settings
   ensure_litellm_ghcr_image "$LITELLM_IMAGE"
   refuse_bad_image_tag "$LITELLM_IMAGE"
   refuse_bad_image_tag "$POSTGRES_IMAGE"
@@ -853,7 +1125,8 @@ main() {
   prepare_host
   ensure_layout
   copy_helper_scripts
-  write_env_file
+  write_secret_env_file
+  write_gateway_env_file
   write_litellm_config
 
   local litellm_digest
@@ -861,15 +1134,20 @@ main() {
   litellm_digest="$(pull_and_resolve_digest "$LITELLM_IMAGE")"
   cosign_verify_image "$LITELLM_IMAGE"
   cosign_verify_image "$litellm_digest"
-  align_config_permissions_for_image "$litellm_digest"
   postgres_digest="$(pull_and_resolve_digest "$POSTGRES_IMAGE")"
 
-  validate_config_with_container "$litellm_digest"
   write_compose_file "$litellm_digest" "$postgres_digest"
+  ensure_compose_network_exists
+  collect_docker_bridge_settings
+  write_gateway_env_file
+  write_litellm_config
+  align_config_permissions_for_image "$litellm_digest"
+  validate_config_with_container "$litellm_digest"
   write_egress_allowlist
   configure_ufw
   write_docker_user_rules
   start_gateway
+  refresh_detected_docker_network_settings
 
   "${APP_DIR}/verify-litellm-gateway.sh" || warn "Verification reported issues. Review output before using the gateway."
   print_next_steps

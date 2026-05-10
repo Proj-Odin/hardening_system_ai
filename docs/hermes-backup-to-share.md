@@ -91,7 +91,7 @@ chmod 600 /home/admin/.smbcredentials/truenas-zeroclaw
 Test access:
 
 ```sh
-smbclient //172.16.172.27/zeroclaw-backups -A /home/admin/.smbcredentials/truenas-zeroclaw -c 'ls'
+smbclient //SMB_HOST/zeroclaw-backups -A /home/admin/.smbcredentials/truenas-zeroclaw -c 'ls'
 ```
 
 Run a Hermes backup:
@@ -99,7 +99,7 @@ Run a Hermes backup:
 ```sh
 DEST_MODE=smbclient \
 APP_DIR=/home/admin/hermes \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' \
 ./scripts/backup-hermes-to-share.sh
 ```
@@ -127,7 +127,7 @@ The backup contains:
 DRY_RUN=1 \
 DEST_MODE=smbclient \
 APP_DIR=/home/admin/hermes \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' \
 ./scripts/backup-hermes-to-share.sh
 ```
@@ -154,7 +154,7 @@ ${DEST_ROOT}/hermes/${HOST}/${TIMESTAMP}/
 ## Cron
 
 ```cron
-45 2 * * * DEST_MODE=smbclient APP_DIR=/home/admin/hermes SMB_SHARE='//172.16.172.27/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-hermes-to-share.sh >> /home/admin/hermes-backup.log 2>&1
+45 2 * * * DEST_MODE=smbclient APP_DIR=/home/admin/hermes SMB_SHARE='//SMB_HOST/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-hermes-to-share.sh >> /home/admin/hermes-backup.log 2>&1
 ```
 
 ## Restore
