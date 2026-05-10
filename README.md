@@ -83,6 +83,12 @@ Alpine-specific notes:
 | `tailscale-gateway` | Identity-aware private gateway | SSH can be restricted to `tailscale0` | Tailscale SSH prompt (encrypted admin path), forwarding options | Tailscale install, SSH restriction, subnet routing, `tailscale up` |
 | `custom` | Build-your-own role | User-defined | User-defined with same global safety checks | Custom firewall ports and package list |
 
+### Docker-Host Package Behavior
+
+On Debian/Ubuntu, the `docker-host` profile installs APT prerequisites first, then prefers the official Docker APT repository when the detected OS and codename support it. The repository is written idempotently under `/etc/apt/sources.list.d/` and uses a GPG key in `/etc/apt/keyrings`, not `apt-key`.
+
+Docker Compose v2 is checked before install. The script installs `docker-compose-plugin` when available, falls back to a valid v2 distro package such as `docker-compose-v2` when appropriate, and does not automatically install the legacy Python `docker-compose` v1 package. If Docker Engine installs but Compose v2 is unavailable, the run reports a controlled warning with `apt-cache policy docker-compose-plugin docker-compose-v2` remediation steps.
+
 ## Checkmk Integration (All Profiles)
 
 The hardening script includes an optional Checkmk stage for every profile.
@@ -117,6 +123,7 @@ For Alpine:
 - Optional Fail2Ban (recommended)
 - Optional automatic patching (interactive)
 - Optional AppArmor (interactive)
+- Optional IPv6 disable via a managed sysctl drop-in (`/etc/sysctl.d/99-disable-ipv6.conf`), default off and reversible by removing the drop-in. It can be preselected with `DISABLE_IPV6=true` or `HARDEN_DISABLE_IPV6=true`.
 - Summary + final confirmation required before apply
 
 ## Logs, Backups, and Reruns
@@ -142,7 +149,7 @@ ZeroClaw backup example:
 
 ```sh
 DEST_MODE=smbclient \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/backup-zeroclaw-to-share.sh
@@ -158,7 +165,7 @@ APP_NAME=zeroclaw \
 APP_USER=admin \
 APP_HOME=/home/admin \
 APP_DIR=/home/admin/.zeroclaw \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/restore-app-from-share.sh
@@ -175,7 +182,7 @@ APP_NAME=zeroclaw \
 APP_USER=admin \
 APP_HOME=/home/admin \
 APP_DIR=/home/admin/.zeroclaw \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/restore-app-from-share.sh
@@ -197,11 +204,16 @@ The LiteLLM workflow is Docker-only. It does not install LiteLLM from PyPI, requ
 |---|---|---|
 | `scripts/setup-litellm-gateway.sh` | First install or safe rerun of the gateway VM | Target Debian/Ubuntu VM |
 | `scripts/verify-litellm-gateway.sh` | Check container health, digest pinning, UFW exposure, `.env` permissions, PyPI absence, and API smoke tests | Target Debian/Ubuntu VM |
+| `scripts/configure-ollama-cloud-bridge.sh` | Configure host Ollama as the private bridge used by LiteLLM | Target Debian/Ubuntu VM |
+| `scripts/verify-ollama-cloud-bridge.sh` | Verify host Ollama, container reachability, chat, and embeddings through the bridge | Target Debian/Ubuntu VM |
+| `scripts/create-litellm-client-key.sh` | Create scoped LiteLLM virtual keys for clients | Target Debian/Ubuntu VM |
 | `scripts/update-litellm-gateway.sh` | Move to an explicit new signed LiteLLM image tag and roll back on failed verification | Target Debian/Ubuntu VM |
 | `scripts/backup-litellm-gateway.sh` | Back up Compose, config, secrets, and Postgres dump, with optional `smbclient` upload | Target Debian/Ubuntu VM |
 | `examples/litellm-gateway.env.example` | See expected environment variables and placeholder-only secret names | Reference only |
-| `examples/litellm-config.yaml.example` | See the minimal OpenRouter-backed LiteLLM config shape | Reference only |
+| `examples/litellm-gateway.gateway.env.example` | See non-secret network settings saved to `/opt/litellm-gateway/gateway.env` | Reference only |
+| `examples/litellm-config.yaml.example` | See the Ollama bridge model config shape | Reference only |
 | `docs/litellm-gateway-hardening.md` | Full runbook: rationale, rotation, virtual keys, firewall notes, emergency response | Anywhere |
+| `docs/zeroclaw-litellm-integration.md` | Generic ZeroClaw/OpenAI-compatible client setup through LiteLLM | Anywhere |
 
 ### Clean VM Quickstart
 
@@ -209,17 +221,21 @@ Use Debian 12/13 or Ubuntu 24.04. Run setup from the repo checkout on the VM:
 
 ```sh
 sudo ./scripts/setup-litellm-gateway.sh \
-  --trusted-cidr 172.16.172.0/24 \
-  --bind-addr 0.0.0.0 \
-  --port 4000
+  --litellm-host-ip <LITELLM_HOST_IP> \
+  --litellm-port <LITELLM_PORT> \
+  --trusted-client-cidr <TRUSTED_CLIENT_CIDR> \
+  --ollama-bridge-api-base <OLLAMA_BRIDGE_API_BASE> \
+  --docker-litellm-subnet <DOCKER_LITELLM_SUBNET>
 ```
 
-The installer prompts for `OPENROUTER_API_KEY` if it is missing. Use a dedicated low-budget OpenRouter key, not a personal master key.
+The installer prompts for missing network values and for an optional `OPENROUTER_API_KEY`. Leave OpenRouter blank unless you intentionally want the `openrouter-auto` route.
 
 After setup:
 
 ```sh
 sudo /opt/litellm-gateway/verify-litellm-gateway.sh
+sudo /opt/litellm-gateway/configure-ollama-cloud-bridge.sh
+sudo /opt/litellm-gateway/verify-ollama-cloud-bridge.sh
 sudo docker compose -p litellm-gateway -f /opt/litellm-gateway/docker-compose.yml ps
 sudo ufw status verbose
 ```
@@ -227,8 +243,8 @@ sudo ufw status verbose
 Point clients at:
 
 ```yaml
-base_url: http://<llm-gateway-ip>:4000/v1
-model: openrouter-auto
+base_url: http://<LITELLM_HOST_IP>:<LITELLM_PORT>/v1
+model: ollama-kimi-k26-cloud
 api_key: <LiteLLM virtual key>
 ```
 
@@ -236,7 +252,7 @@ Update with an explicit stable image tag:
 
 ```sh
 sudo /opt/litellm-gateway/update-litellm-gateway.sh \
-  --image ghcr.io/berriai/litellm-non_root:v1.83.0-stable
+  --image ghcr.io/berriai/litellm-non_root:v1.83.3-stable.patch.2
 ```
 
 Back up locally:
@@ -249,6 +265,7 @@ sudo /opt/litellm-gateway/backup-litellm-gateway.sh
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
 - Run `bash test_ssh_port_detection.sh` after touching SSH detection or validation logic.
+- Run `bash test_ipv6_disable.sh` after touching IPv6 sysctl hardening logic.
 - Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.
 - Track real cloud test work in `TODO_CLOUD_E2E.md`. Generated cloud or mock run artifacts should stay local and uncommitted.
 

@@ -5,6 +5,7 @@ umask 077
 
 APP_DIR="${APP_DIR:-/opt/litellm-gateway}"
 ENV_FILE="${APP_DIR}/.env"
+GATEWAY_ENV_FILE="${APP_DIR}/gateway.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
 CONFIG_FILE="${APP_DIR}/config/config.yaml"
 BACKUP_ROOT="${APP_DIR}/backups"
@@ -106,9 +107,18 @@ image_repo() {
 }
 
 get_env_value() {
-  local key="$1"
+  get_file_value "$ENV_FILE" "$1"
+}
+
+get_gateway_value() {
+  get_file_value "$GATEWAY_ENV_FILE" "$1"
+}
+
+get_file_value() {
+  local file="$1"
+  local key="$2"
   local value
-  [ -f "$ENV_FILE" ] || return 0
+  [ -f "$file" ] || return 0
   value="$(awk -F= -v key="$key" '
     /^[[:space:]]*#/ || $0 !~ /=/ { next }
     {
@@ -121,7 +131,7 @@ get_env_value() {
         exit
       }
     }
-  ' "$ENV_FILE")"
+  ' "$file")"
   value="${value%$'\r'}"
   case "$value" in
     \"*\") value="${value#\"}"; value="${value%\"}" ;;
@@ -132,7 +142,8 @@ get_env_value() {
 
 load_settings() {
   local env_project
-  env_project="$(get_env_value COMPOSE_PROJECT_NAME)"
+  env_project="$(get_gateway_value COMPOSE_PROJECT_NAME)"
+  [ -n "$env_project" ] || env_project="$(get_env_value COMPOSE_PROJECT_NAME)"
   COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${env_project:-litellm-gateway}}"
 }
 
@@ -212,6 +223,7 @@ backup_metadata() {
   [ -f "$COMPOSE_FILE" ] || die "Missing compose file: $COMPOSE_FILE"
   cp -a "$COMPOSE_FILE" "$dir/docker-compose.yml"
   [ -f "$CONFIG_FILE" ] && cp -a "$CONFIG_FILE" "$dir/config.yaml"
+  [ -f "$GATEWAY_ENV_FILE" ] && cp -a "$GATEWAY_ENV_FILE" "$dir/gateway.env"
   [ -f "$ENV_FILE" ] && cp -a "$ENV_FILE" "$dir/env.SENSITIVE"
   chmod -R go-rwx "$dir"
   log "Backed up update metadata: $dir"

@@ -78,14 +78,14 @@ chmod 600 /home/admin/.smbcredentials/truenas-zeroclaw
 Test access:
 
 ```sh
-smbclient //172.16.172.27/zeroclaw-backups -A /home/admin/.smbcredentials/truenas-zeroclaw -c 'ls'
+smbclient //SMB_HOST/zeroclaw-backups -A /home/admin/.smbcredentials/truenas-zeroclaw -c 'ls'
 ```
 
 Run a backup:
 
 ```sh
 DEST_MODE=smbclient \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' \
 ./scripts/backup-zeroclaw-to-share.sh
 ```
@@ -119,7 +119,7 @@ Preview without creating backup files or remote directories:
 ```sh
 DRY_RUN=1 \
 DEST_MODE=smbclient \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' \
 ./scripts/backup-zeroclaw-to-share.sh
 ```
@@ -149,7 +149,7 @@ With `REQUIRE_MOUNT=1`, the script refuses to write unless `SHARE_MOUNT` appears
 ## Cron
 
 ```cron
-30 2 * * * DEST_MODE=smbclient SMB_SHARE='//172.16.172.27/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-zeroclaw-to-share.sh >> /home/admin/zeroclaw-backup.log 2>&1
+30 2 * * * DEST_MODE=smbclient SMB_SHARE='//SMB_HOST/zeroclaw-backups' SMB_CREDS='/home/admin/.smbcredentials/truenas-zeroclaw' /home/admin/hardening_system_ai/scripts/backup-zeroclaw-to-share.sh >> /home/admin/zeroclaw-backup.log 2>&1
 ```
 
 ## Restore
@@ -163,7 +163,7 @@ AUTO_INSTALL_DEPS=1 \
 RESTORE_CONFIRM=1 \
 BACKUP_HOST=alpine-claw3 \
 BACKUP_TIMESTAMP=20260427_022240 \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/restore-zeroclaw-from-share.sh
@@ -175,7 +175,7 @@ Dry run the newest backup for the current host:
 AUTO_INSTALL_DEPS=1 \
 DRY_RUN=1 \
 RESTORE_LATEST=1 \
-SMB_SHARE='//172.16.172.27/zeroclaw-backups' \
+SMB_SHARE='//SMB_HOST/zeroclaw-backups' \
 SMB_CREDS='/etc/smbcredentials/truenas-zeroclaw' \
 SMB_REMOTE_ROOT='zeroclaw-backups' \
 ./scripts/restore-zeroclaw-from-share.sh
@@ -184,7 +184,7 @@ SMB_REMOTE_ROOT='zeroclaw-backups' \
 The restore script supports both clean and duplicated remote roots, including:
 
 ```text
-//172.16.172.27/zeroclaw-backups/zeroclaw-backups/zeroclaw/alpine-claw3/20260427_022240/
+//SMB_HOST/zeroclaw-backups/zeroclaw-backups/zeroclaw/alpine-claw3/20260427_022240/
 ```
 
 It verifies the downloaded backup before changing `APP_DIR`:
