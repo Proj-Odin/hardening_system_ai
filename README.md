@@ -89,8 +89,6 @@ On Debian/Ubuntu, the `docker-host` profile installs APT prerequisites first, th
 
 Docker Compose v2 is checked before install. The script installs `docker-compose-plugin` when available, falls back to a valid v2 distro package such as `docker-compose-v2` when appropriate, and does not automatically install the legacy Python `docker-compose` v1 package. If Docker Engine installs but Compose v2 is unavailable, the run reports a controlled warning with `apt-cache policy docker-compose-plugin docker-compose-v2` remediation steps.
 
-Ubuntu 25.x handling is codename-driven. Ubuntu 25.10 (`questing`) uses the official Docker repository when Docker publishes matching repository metadata; Ubuntu 25.04 (`plucky`) falls back to distro Docker packages instead of writing an unsupported Docker repository entry when official metadata is unavailable.
-
 ## Checkmk Integration (All Profiles)
 
 The hardening script includes an optional Checkmk stage for every profile.
@@ -125,6 +123,7 @@ For Alpine:
 - Optional Fail2Ban (recommended)
 - Optional automatic patching (interactive)
 - Optional AppArmor (interactive)
+- Optional IPv6 disable via a managed sysctl drop-in (`/etc/sysctl.d/99-disable-ipv6.conf`), default off and reversible by removing the drop-in. It can be preselected with `DISABLE_IPV6=true` or `HARDEN_DISABLE_IPV6=true`.
 - Summary + final confirmation required before apply
 
 ## Logs, Backups, and Reruns
@@ -266,6 +265,7 @@ sudo /opt/litellm-gateway/backup-litellm-gateway.sh
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
 - Run `bash test_ssh_port_detection.sh` after touching SSH detection or validation logic.
+- Run `bash test_ipv6_disable.sh` after touching IPv6 sysctl hardening logic.
 - Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.
 - Track real cloud test work in `TODO_CLOUD_E2E.md`. Generated cloud or mock run artifacts should stay local and uncommitted.
 
