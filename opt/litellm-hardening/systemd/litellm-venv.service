@@ -1,0 +1,41 @@
+[Unit]
+Description=Hardened LiteLLM venv deployment
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/litellm-hardening/litellm.env
+ConditionPathExists=/opt/litellm-hardening/litellm_config.yaml
+ConditionPathExists=/opt/litellm-venv/bin/litellm
+
+[Service]
+Type=simple
+User=litellm
+Group=litellm
+WorkingDirectory=/opt/litellm-hardening
+EnvironmentFile=/etc/litellm-hardening/litellm.env
+StateDirectory=litellm
+RuntimeDirectory=litellm
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/litellm /run/litellm
+ExecStartPre=/opt/litellm-hardening/validate-litellm.sh --preflight
+ExecStart=/usr/bin/env bash -lc 'set -euo pipefail; exec /opt/litellm-venv/bin/litellm --config /opt/litellm-hardening/litellm_config.yaml --host "${LITELLM_BIND_ADDRESS}" --port "${LITELLM_BIND_PORT}" --num_workers "${LITELLM_NUM_WORKERS}" --run_gunicorn'
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=600
+TimeoutStopSec=120
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
