@@ -83,6 +83,12 @@ Alpine-specific notes:
 | `tailscale-gateway` | Identity-aware private gateway | SSH can be restricted to `tailscale0` | Tailscale SSH prompt (encrypted admin path), forwarding options | Tailscale install, SSH restriction, subnet routing, `tailscale up` |
 | `custom` | Build-your-own role | User-defined | User-defined with same global safety checks | Custom firewall ports and package list |
 
+### Docker-Host Package Behavior
+
+On Debian/Ubuntu, the `docker-host` profile installs APT prerequisites first, then prefers the official Docker APT repository when the detected OS and codename support it. The repository is written idempotently under `/etc/apt/sources.list.d/` and uses a GPG key in `/etc/apt/keyrings`, not `apt-key`.
+
+Docker Compose v2 is checked before install. The script installs `docker-compose-plugin` when available, falls back to a valid v2 distro package such as `docker-compose-v2` when appropriate, and does not automatically install the legacy Python `docker-compose` v1 package. If Docker Engine installs but Compose v2 is unavailable, the run reports a controlled warning with `apt-cache policy docker-compose-plugin docker-compose-v2` remediation steps.
+
 ## Checkmk Integration (All Profiles)
 
 The hardening script includes an optional Checkmk stage for every profile.
