@@ -119,6 +119,8 @@ For Alpine:
 - UFW default policy: deny incoming, allow outgoing
 - SSH allow rule is added before firewall enable
 - Existing and new SSH ports are both allowed when port is changed
+- SSH password authentication stays available by default until key login is verified; rerun the hardening script after testing keys to disable passwords
+- Debian/Ubuntu SSH keeps `UsePAM yes` for PAM account/session processing while disabling keyboard-interactive auth separately
 - Optional SSH rate limiting in both SSH and UFW flow
 - Root SSH login disable option
 - Password SSH disable option only when key material is detected
@@ -265,7 +267,7 @@ sudo /opt/litellm-gateway/backup-litellm-gateway.sh
 ## Validation
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
-- Run `bash test_ssh_port_detection.sh` after touching SSH detection or validation logic.
+- Run `bash test_ssh_port_detection.sh` and `bash test_ssh_hardening_config.sh` after touching SSH detection, validation, or login-policy logic.
 - Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.
 - Track real cloud test work in `TODO_CLOUD_E2E.md`. Generated cloud or mock run artifacts should stay local and uncommitted.
 
