@@ -1,0 +1,1541 @@
+diff --git a/crates/zeroclaw-channels/src/orchestrator/mod.rs b/crates/zeroclaw-channels/src/orchestrator/mod.rs
+index c511ca4..ed2691c 100644
+--- a/crates/zeroclaw-channels/src/orchestrator/mod.rs
++++ b/crates/zeroclaw-channels/src/orchestrator/mod.rs
+@@ -180,6 +180,17 @@ const MAX_CHANNEL_HISTORY: usize = 50;
+ /// reducing noise in memory recall.
+ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+ 
++fn sanitize_memory_text(
++    message: &str,
++    memory_config: &zeroclaw_config::schema::MemoryConfig,
++) -> String {
++    let sanitize_config = zeroclaw_memory::EmbeddingSanitizationConfig::from(memory_config);
++    let sanitized =
++        zeroclaw_memory::sanitize_for_embedding_with_config(message, &sanitize_config);
++    zeroclaw_memory::log_embedding_skip_if_media_only(&sanitized);
++    sanitized.text
++}
++
+ // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
+ #[allow(unused_imports)]
+ pub use zeroclaw_runtime::agent::system_prompt::{
+@@ -1935,6 +1946,9 @@ async fn build_memory_context_for_sessions(
+ ) -> String {
+     let mut entries = Vec::new();
+     let mut seen_keys = HashSet::new();
++    if user_msg.trim().is_empty() {
++        return String::new();
++    }
+ 
+     match session_ids {
+         [] => {}
+@@ -2797,16 +2811,17 @@ async fn process_channel_message(
+             return;
+         }
+     };
++    let memory_text = sanitize_memory_text(&msg.content, &ctx.prompt_config.memory);
+     if ctx.auto_save_memory
+-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+-        && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
++        && memory_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
++        && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
+     {
+         let autosave_key = conversation_memory_key(&msg);
+         let _ = ctx
+             .memory
+             .store(
+                 &autosave_key,
+-                &msg.content,
++                &memory_text,
+                 zeroclaw_memory::MemoryCategory::Conversation,
+                 Some(&history_key),
+             )
+@@ -2913,7 +2928,7 @@ async fn process_channel_message(
+     let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
+     let sender_memory_fut = build_memory_context_for_sessions(
+         ctx.memory.as_ref(),
+-        &msg.content,
++        &memory_text,
+         ctx.min_relevance_score,
+         sender_session_ids.as_slice(),
+     );
+@@ -2921,7 +2936,7 @@ async fn process_channel_message(
+     let (sender_memory, group_memory) = if is_group_chat {
+         let group_memory_fut = build_memory_context(
+             ctx.memory.as_ref(),
+-            &msg.content,
++            &memory_text,
+             ctx.min_relevance_score,
+             Some(&history_key),
+         );
+@@ -3558,11 +3573,11 @@ async fn process_channel_message(
+             }
+ 
+             // Fire-and-forget LLM-driven memory consolidation.
+-            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
++            if ctx.auto_save_memory && memory_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                 let provider = Arc::clone(&ctx.provider);
+                 let model = ctx.model.to_string();
+                 let memory = Arc::clone(&ctx.memory);
+-                let user_msg = msg.content.clone();
++                let user_msg = memory_text.clone();
+                 let assistant_resp = delivered_response.clone();
+                 tokio::spawn(async move {
+                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+@@ -7276,6 +7291,48 @@ BTC is currently around $65,000 based on latest tool output."#
+         }
+     }
+ 
++    #[derive(Default)]
++    struct VisionHistoryCaptureProvider {
++        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
++    }
++
++    #[async_trait::async_trait]
++    impl Provider for VisionHistoryCaptureProvider {
++        fn capabilities(&self) -> zeroclaw_api::provider::ProviderCapabilities {
++            zeroclaw_api::provider::ProviderCapabilities {
++                vision: true,
++                ..Default::default()
++            }
++        }
++
++        async fn chat_with_system(
++            &self,
++            _system_prompt: Option<&str>,
++            _message: &str,
++            _model: &str,
++            _temperature: Option<f64>,
++        ) -> anyhow::Result<String> {
++            Ok("REPLY".to_string())
++        }
++
++        async fn chat_with_history(
++            &self,
++            messages: &[ChatMessage],
++            _model: &str,
++            _temperature: Option<f64>,
++        ) -> anyhow::Result<String> {
++            let snapshot = messages
++                .iter()
++                .map(|m| (m.role.clone(), m.content.clone()))
++                .collect::<Vec<_>>();
++            self.calls
++                .lock()
++                .unwrap_or_else(|e| e.into_inner())
++                .push(snapshot);
++            Ok("vision ok".to_string())
++        }
++    }
++
+     struct DelayedHistoryCaptureProvider {
+         delay: Duration,
+         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+@@ -8869,6 +8926,72 @@ BTC is currently around $65,000 based on latest tool output."#
+         }
+     }
+ 
++    #[derive(Default)]
++    struct CapturingMemory {
++        stores: std::sync::Mutex<Vec<String>>,
++        recalls: std::sync::Mutex<Vec<String>>,
++    }
++
++    #[async_trait::async_trait]
++    impl Memory for CapturingMemory {
++        fn name(&self) -> &str {
++            "capturing-memory"
++        }
++
++        async fn store(
++            &self,
++            _key: &str,
++            content: &str,
++            _category: zeroclaw_memory::MemoryCategory,
++            _session_id: Option<&str>,
++        ) -> anyhow::Result<()> {
++            self.stores
++                .lock()
++                .unwrap_or_else(|e| e.into_inner())
++                .push(content.to_string());
++            Ok(())
++        }
++
++        async fn recall(
++            &self,
++            query: &str,
++            _limit: usize,
++            _session_id: Option<&str>,
++            _since: Option<&str>,
++            _until: Option<&str>,
++        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
++            self.recalls
++                .lock()
++                .unwrap_or_else(|e| e.into_inner())
++                .push(query.to_string());
++            Ok(Vec::new())
++        }
++
++        async fn get(&self, _key: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
++            Ok(None)
++        }
++
++        async fn list(
++            &self,
++            _category: Option<&zeroclaw_memory::MemoryCategory>,
++            _session_id: Option<&str>,
++        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
++            Ok(Vec::new())
++        }
++
++        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
++            Ok(false)
++        }
++
++        async fn count(&self) -> anyhow::Result<usize> {
++            Ok(0)
++        }
++
++        async fn health_check(&self) -> bool {
++            true
++        }
++    }
++
+     struct RecallMemory;
+ 
+     #[async_trait::async_trait]
+@@ -11690,6 +11813,146 @@ This is an example JSON object for profile settings."#;
+         );
+     }
+ 
++    #[tokio::test]
++    async fn e2e_media_memory_uses_sanitized_copy_and_provider_keeps_image() {
++        let channel_impl = Arc::new(RecordingChannel::default());
++        let channel: Arc<dyn Channel> = channel_impl.clone();
++
++        let mut channels_by_name = HashMap::new();
++        channels_by_name.insert(channel.name().to_string(), channel);
++
++        let provider_impl = Arc::new(VisionHistoryCaptureProvider::default());
++        let provider: Arc<dyn Provider> = provider_impl.clone();
++        let memory_impl = Arc::new(CapturingMemory::default());
++        let memory: Arc<dyn Memory> = memory_impl.clone();
++
++        let runtime_ctx = Arc::new(ChannelRuntimeContext {
++            channels_by_name: Arc::new(channels_by_name),
++            provider,
++            default_provider: Arc::new("dummy".to_string()),
++            memory,
++            tools_registry: Arc::new(vec![]),
++            observer: Arc::new(NoopObserver),
++            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
++            model: Arc::new("test-model".to_string()),
++            temperature: 0.0,
++            auto_save_memory: true,
++            max_tool_iterations: 5,
++            min_relevance_score: 0.0,
++            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
++                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
++            ))),
++            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
++            provider_cache: Arc::new(Mutex::new(HashMap::new())),
++            route_overrides: Arc::new(Mutex::new(HashMap::new())),
++            api_key: None,
++            api_url: None,
++            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
++            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
++            workspace_dir: Arc::new(std::env::temp_dir()),
++            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
++            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
++            interrupt_on_new_message: InterruptOnNewMessageConfig {
++                telegram: false,
++                slack: false,
++                discord: false,
++                mattermost: false,
++                matrix: false,
++            },
++            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
++            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
++            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
++            hooks: None,
++            non_cli_excluded_tools: Arc::new(Vec::new()),
++            autonomy_level: AutonomyLevel::default(),
++            tool_call_dedup_exempt: Arc::new(Vec::new()),
++            model_routes: Arc::new(Vec::new()),
++            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
++            ack_reactions: false,
++            show_tool_calls: true,
++            session_store: None,
++            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
++                &zeroclaw_config::schema::AutonomyConfig::default(),
++            )),
++            activated_tools: None,
++            cost_tracking: None,
++            pacing: zeroclaw_config::schema::PacingConfig::default(),
++            max_tool_result_chars: 0,
++            context_token_budget: 0,
++            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
++                Duration::ZERO,
++            )),
++            receipt_generator: None,
++            show_receipts_in_response: false,
++        });
++
++        process_channel_message(
++            runtime_ctx,
++            zeroclaw_api::channel::ChannelMessage {
++                id: "msg-photo-safe-memory".to_string(),
++                sender: "zeroclaw_user".to_string(),
++                reply_target: "chat-photo".to_string(),
++                content:
++                    "[IMAGE:data:image/png;base64,AAAA]\n\nDescribe serial number A17 in this image"
++                        .to_string(),
++                channel: "test-channel".to_string(),
++                timestamp: 1,
++                thread_ts: None,
++                interruption_scope_id: None,
++                attachments: vec![],
++            },
++            CancellationToken::new(),
++        )
++        .await;
++
++        let stored = memory_impl
++            .stores
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        assert_eq!(
++            stored.as_slice(),
++            ["Describe serial number A17 in this image"]
++        );
++        assert!(
++            stored
++                .iter()
++                .all(|content| !content.contains("[IMAGE:") && !content.contains("base64")),
++            "autosave must not persist raw image payloads for embedding"
++        );
++        drop(stored);
++
++        let recalls = memory_impl
++            .recalls
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        assert_eq!(
++            recalls.as_slice(),
++            ["Describe serial number A17 in this image"]
++        );
++        assert!(
++            recalls
++                .iter()
++                .all(|query| !query.contains("[IMAGE:") && !query.contains("base64")),
++            "recall query must not send raw media to embedding"
++        );
++        drop(recalls);
++
++        let calls = provider_impl
++            .calls
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        let user_turn = calls
++            .last()
++            .and_then(|messages| messages.iter().find(|(role, _)| role == "user"))
++            .map(|(_, content)| content.as_str())
++            .expect("provider should receive the user turn");
++        assert!(user_turn.contains("Describe serial number A17 in this image"));
++        assert!(
++            user_turn.contains("[IMAGE:data:image/png;base64,AAAA]"),
++            "provider dispatch must keep the image payload intact, got: {user_turn}"
++        );
++    }
++
+     #[tokio::test]
+     async fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
+         let channel_impl = Arc::new(RecordingChannel::default());
+diff --git a/crates/zeroclaw-config/src/schema.rs b/crates/zeroclaw-config/src/schema.rs
+index 8b6ae01..9a2fa7e 100644
+--- a/crates/zeroclaw-config/src/schema.rs
++++ b/crates/zeroclaw-config/src/schema.rs
+@@ -5417,6 +5417,18 @@ pub struct MemoryConfig {
+     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the provider's model page.
+     #[serde(default = "default_embedding_dims")]
+     pub embedding_dimensions: usize,
++    /// Include short placeholders such as `[image attached]` in embedding text after media payloads are removed. Default false keeps media-only turns out of embeddings.
++    #[serde(default)]
++    pub embed_media_placeholders: bool,
++    /// Allow assistant-authored image summaries/captions that are already plain text to be embedded. Raw media payloads are still stripped.
++    #[serde(default = "default_embed_assistant_image_summaries")]
++    pub embed_assistant_image_summaries: bool,
++    /// Skip embedding entirely when media sanitization leaves no text. Default true prevents image-only messages from reaching text embedders.
++    #[serde(default = "default_skip_embedding_for_image_messages")]
++    pub skip_embedding_for_image_messages: bool,
++    /// Maximum sanitized text length sent to embedding providers.
++    #[serde(default = "default_embedding_text_max_chars")]
++    pub embedding_text_max_chars: usize,
+     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
+     #[serde(default = "default_vector_weight")]
+     pub vector_weight: f64,
+@@ -5585,6 +5597,15 @@ fn default_embedding_model() -> String {
+ fn default_embedding_dims() -> usize {
+     1536
+ }
++fn default_embed_assistant_image_summaries() -> bool {
++    true
++}
++fn default_skip_embedding_for_image_messages() -> bool {
++    true
++}
++fn default_embedding_text_max_chars() -> usize {
++    8192
++}
+ fn default_vector_weight() -> f64 {
+     0.7
+ }
+@@ -5623,6 +5644,10 @@ impl Default for MemoryConfig {
+             embedding_provider: default_embedding_provider(),
+             embedding_model: default_embedding_model(),
+             embedding_dimensions: default_embedding_dims(),
++            embed_media_placeholders: false,
++            embed_assistant_image_summaries: default_embed_assistant_image_summaries(),
++            skip_embedding_for_image_messages: default_skip_embedding_for_image_messages(),
++            embedding_text_max_chars: default_embedding_text_max_chars(),
+             vector_weight: default_vector_weight(),
+             keyword_weight: default_keyword_weight(),
+             search_mode: SearchMode::default(),
+diff --git a/crates/zeroclaw-gateway/src/lib.rs b/crates/zeroclaw-gateway/src/lib.rs
+index 1eb2cd2..f26a15a 100644
+--- a/crates/zeroclaw-gateway/src/lib.rs
++++ b/crates/zeroclaw-gateway/src/lib.rs
+@@ -155,6 +155,17 @@ fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
+         .map(str::to_owned)
+ }
+ 
++fn sanitize_memory_text(
++    message: &str,
++    memory_config: &zeroclaw_config::schema::MemoryConfig,
++) -> String {
++    let sanitize_config = zeroclaw_memory::EmbeddingSanitizationConfig::from(memory_config);
++    let sanitized =
++        zeroclaw_memory::sanitize_for_embedding_with_config(message, &sanitize_config);
++    zeroclaw_memory::log_embedding_skip_if_media_only(&sanitized);
++    sanitized.text
++}
++
+ fn hash_webhook_secret(value: &str) -> String {
+     use sha2::{Digest, Sha256};
+ 
+@@ -1667,13 +1678,17 @@ async fn handle_webhook(
+     let message = &webhook_body.message;
+     let session_id = webhook_session_id(&headers);
+ 
+-    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
++    let memory_text = sanitize_memory_text(message, &state.config.lock().memory);
++    if state.auto_save
++        && !memory_text.trim().is_empty()
++        && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
++    {
+         let key = webhook_memory_key();
+         let _ = state
+             .mem
+             .store(
+                 &key,
+-                message,
++                &memory_text,
+                 MemoryCategory::Conversation,
+                 session_id.as_deref(),
+             )
+@@ -1926,13 +1941,17 @@ async fn handle_whatsapp_message(
+         let session_id = sender_session_id("whatsapp", msg);
+ 
+         // Auto-save to memory
+-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
++        let memory_text = sanitize_memory_text(&msg.content, &state.config.lock().memory);
++        if state.auto_save
++            && !memory_text.trim().is_empty()
++            && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
++        {
+             let key = whatsapp_memory_key(msg);
+             let _ = state
+                 .mem
+                 .store(
+                     &key,
+-                    &msg.content,
++                    &memory_text,
+                     MemoryCategory::Conversation,
+                     Some(&session_id),
+                 )
+@@ -2045,13 +2064,17 @@ async fn handle_linq_webhook(
+         let session_id = sender_session_id("linq", msg);
+ 
+         // Auto-save to memory
+-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
++        let memory_text = sanitize_memory_text(&msg.content, &state.config.lock().memory);
++        if state.auto_save
++            && !memory_text.trim().is_empty()
++            && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
++        {
+             let key = linq_memory_key(msg);
+             let _ = state
+                 .mem
+                 .store(
+                     &key,
+-                    &msg.content,
++                    &memory_text,
+                     MemoryCategory::Conversation,
+                     Some(&session_id),
+                 )
+@@ -2160,13 +2183,17 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
+         let session_id = sender_session_id("wati", msg);
+ 
+         // Auto-save to memory
+-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
++        let memory_text = sanitize_memory_text(&msg.content, &state.config.lock().memory);
++        if state.auto_save
++            && !memory_text.trim().is_empty()
++            && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
++        {
+             let key = wati_memory_key(msg);
+             let _ = state
+                 .mem
+                 .store(
+                     &key,
+-                    &msg.content,
++                    &memory_text,
+                     MemoryCategory::Conversation,
+                     Some(&session_id),
+                 )
+@@ -2277,13 +2304,17 @@ async fn handle_nextcloud_talk_webhook(
+         );
+         let session_id = sender_session_id("nextcloud_talk", msg);
+ 
+-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
++        let memory_text = sanitize_memory_text(&msg.content, &state.config.lock().memory);
++        if state.auto_save
++            && !memory_text.trim().is_empty()
++            && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
++        {
+             let key = nextcloud_talk_memory_key(msg);
+             let _ = state
+                 .mem
+                 .store(
+                     &key,
+-                    &msg.content,
++                    &memory_text,
+                     MemoryCategory::Conversation,
+                     Some(&session_id),
+                 )
+diff --git a/crates/zeroclaw-memory/src/embedding_safety.rs b/crates/zeroclaw-memory/src/embedding_safety.rs
+new file mode 100644
+index 0000000..00252db
+--- /dev/null
++++ b/crates/zeroclaw-memory/src/embedding_safety.rs
+@@ -0,0 +1,491 @@
++use std::sync::LazyLock;
++
++use regex::Regex;
++use serde_json::Value;
++use zeroclaw_config::schema::MemoryConfig;
++
++pub const DEFAULT_EMBEDDING_TEXT_MAX_CHARS: usize = 8192;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct EmbeddingSanitizationConfig {
++    pub embed_media_placeholders: bool,
++    pub skip_embedding_for_image_messages: bool,
++    pub embed_assistant_image_summaries: bool,
++    pub max_text_chars: usize,
++}
++
++impl Default for EmbeddingSanitizationConfig {
++    fn default() -> Self {
++        Self {
++            embed_media_placeholders: false,
++            skip_embedding_for_image_messages: true,
++            embed_assistant_image_summaries: true,
++            max_text_chars: DEFAULT_EMBEDDING_TEXT_MAX_CHARS,
++        }
++    }
++}
++
++impl From<&MemoryConfig> for EmbeddingSanitizationConfig {
++    fn from(config: &MemoryConfig) -> Self {
++        Self {
++            embed_media_placeholders: config.embed_media_placeholders,
++            skip_embedding_for_image_messages: config.skip_embedding_for_image_messages,
++            embed_assistant_image_summaries: config.embed_assistant_image_summaries,
++            max_text_chars: config.embedding_text_max_chars,
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SanitizedEmbeddingText {
++    pub text: String,
++    pub had_media: bool,
++}
++
++pub fn sanitize_for_embedding(message: &str) -> String {
++    sanitize_for_embedding_with_config(message, &EmbeddingSanitizationConfig::default()).text
++}
++
++pub fn sanitize_for_embedding_with_config(
++    message: &str,
++    config: &EmbeddingSanitizationConfig,
++) -> SanitizedEmbeddingText {
++    let mut had_media = false;
++    let trimmed = message.trim();
++
++    let mut text = if let Some(json_text) = sanitize_json_message(trimmed, config, &mut had_media) {
++        json_text
++    } else {
++        sanitize_plain_text(trimmed, config, &mut had_media)
++    };
++
++    text = normalize_embedding_text(&text);
++    if config.skip_embedding_for_image_messages && text.is_empty() && had_media {
++        return SanitizedEmbeddingText {
++            text: String::new(),
++            had_media,
++        };
++    }
++
++    SanitizedEmbeddingText {
++        text: truncate_to_chars(&text, config.max_text_chars),
++        had_media,
++    }
++}
++
++pub fn log_embedding_skip_if_media_only(sanitized: &SanitizedEmbeddingText) {
++    log_embedding_sanitization(sanitized);
++}
++
++pub fn log_embedding_sanitization(sanitized: &SanitizedEmbeddingText) {
++    tracing::debug!(
++        "Embedding sanitized text length: {}",
++        sanitized.text.chars().count()
++    );
++    if sanitized.had_media {
++        tracing::info!("Media payload removed from embedding copy");
++    }
++    if sanitized.had_media && sanitized.text.trim().is_empty() {
++        tracing::info!("Skipping embedding: no text content after media sanitization");
++    }
++}
++
++fn sanitize_json_message(
++    message: &str,
++    config: &EmbeddingSanitizationConfig,
++    had_media: &mut bool,
++) -> Option<String> {
++    if !(message.starts_with('{') || message.starts_with('[')) {
++        return None;
++    }
++
++    let value = serde_json::from_str::<Value>(message).ok()?;
++    let mut parts = Vec::new();
++    collect_json_text(&value, config, had_media, &mut parts);
++    Some(parts.join("\n"))
++}
++
++fn collect_json_text(
++    value: &Value,
++    config: &EmbeddingSanitizationConfig,
++    had_media: &mut bool,
++    parts: &mut Vec<String>,
++) {
++    match value {
++        Value::String(text) => {
++            let safe = sanitize_plain_text(text, config, had_media);
++            if !safe.trim().is_empty() {
++                parts.push(safe);
++            }
++        }
++        Value::Array(items) => {
++            for item in items {
++                collect_json_text(item, config, had_media, parts);
++            }
++        }
++        Value::Object(map) => {
++            let value_type = map
++                .get("type")
++                .and_then(Value::as_str)
++                .unwrap_or_default()
++                .to_ascii_lowercase();
++
++            if is_media_json_type(&value_type) || map.keys().any(|key| is_media_json_key(key)) {
++                *had_media = true;
++                if config.embed_media_placeholders {
++                    parts.push(media_placeholder_for_json(&value_type).to_string());
++                }
++            }
++
++            if value_type == "text" || value_type == "input_text" {
++                if let Some(text) = map.get("text").and_then(Value::as_str) {
++                    let safe = sanitize_plain_text(text, config, had_media);
++                    if !safe.trim().is_empty() {
++                        parts.push(safe);
++                    }
++                }
++                return;
++            }
++
++            for key in ["content", "text", "caption", "description", "transcript"] {
++                if let Some(child) = map.get(key) {
++                    collect_json_text(child, config, had_media, parts);
++                }
++            }
++            if config.embed_assistant_image_summaries {
++                for key in [
++                    "summary",
++                    "image_summary",
++                    "vision_summary",
++                    "assistant_image_summary",
++                    "ocr",
++                    "ocr_text",
++                ] {
++                    if let Some(child) = map.get(key) {
++                        collect_json_text(child, config, had_media, parts);
++                    }
++                }
++            }
++        }
++        Value::Null | Value::Bool(_) | Value::Number(_) => {}
++    }
++}
++
++fn is_media_json_type(value_type: &str) -> bool {
++    matches!(
++        value_type,
++        "image"
++            | "image_url"
++            | "input_image"
++            | "document"
++            | "file"
++            | "video"
++            | "audio"
++            | "voice"
++    )
++}
++
++fn is_media_json_key(key: &str) -> bool {
++    matches!(
++        key.to_ascii_lowercase().as_str(),
++        "image_url"
++            | "image"
++            | "images"
++            | "input_image"
++            | "file_data"
++            | "file_id"
++            | "base64"
++            | "data"
++            | "bytes"
++            | "raw"
++            | "telegram_file"
++            | "mime_type"
++            | "content_type"
++    )
++}
++
++fn media_placeholder_for_json(value_type: &str) -> &'static str {
++    match value_type {
++        "video" => "[video attached]",
++        "audio" | "voice" => "[audio attached]",
++        "document" | "file" => "[file attached]",
++        _ => "[image attached]",
++    }
++}
++
++fn sanitize_plain_text(
++    message: &str,
++    config: &EmbeddingSanitizationConfig,
++    had_media: &mut bool,
++) -> String {
++    let mut text = message.to_string();
++    text = strip_json_media_fields(&text, config, had_media);
++    text = strip_media_markers(&text, config, had_media);
++    text = strip_existing_media_placeholders(&text, config, had_media);
++    text = strip_data_uris(&text, had_media);
++    text = strip_long_base64_tokens(&text, had_media);
++    text
++}
++
++fn strip_media_markers(
++    text: &str,
++    config: &EmbeddingSanitizationConfig,
++    had_media: &mut bool,
++) -> String {
++    static RE: LazyLock<Regex> = LazyLock::new(|| {
++        Regex::new(r"(?is)\[(IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
++    });
++
++    let mut saw = false;
++    let replaced = RE.replace_all(text, |captures: &regex::Captures<'_>| {
++        saw = true;
++        if config.embed_media_placeholders {
++            placeholder_for_marker(&captures[1]).to_string()
++        } else {
++            String::new()
++        }
++    });
++    if saw {
++        *had_media = true;
++    }
++    replaced.into_owned()
++}
++
++fn strip_existing_media_placeholders(
++    text: &str,
++    config: &EmbeddingSanitizationConfig,
++    had_media: &mut bool,
++) -> String {
++    static RE: LazyLock<Regex> = LazyLock::new(|| {
++        Regex::new(r"(?i)\[(?:image|photo|media|video|audio|voice|file|document) attached\]")
++            .unwrap()
++    });
++
++    let mut saw = false;
++    let replaced = RE.replace_all(text, |captures: &regex::Captures<'_>| {
++        saw = true;
++        if config.embed_media_placeholders {
++            captures[0].to_ascii_lowercase()
++        } else {
++            String::new()
++        }
++    });
++    if saw {
++        *had_media = true;
++    }
++    replaced.into_owned()
++}
++
++fn strip_data_uris(text: &str, had_media: &mut bool) -> String {
++    static RE: LazyLock<Regex> = LazyLock::new(|| {
++        Regex::new(r"(?i)data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[a-z0-9+/=_-]+").unwrap()
++    });
++
++    if RE.is_match(text) {
++        *had_media = true;
++    }
++    RE.replace_all(text, "").into_owned()
++}
++
++fn strip_long_base64_tokens(text: &str, had_media: &mut bool) -> String {
++    static RE: LazyLock<Regex> =
++        LazyLock::new(|| Regex::new(r"\b[A-Za-z0-9+/]{160,}={0,2}\b").unwrap());
++
++    if RE.is_match(text) {
++        *had_media = true;
++    }
++    RE.replace_all(text, "").into_owned()
++}
++
++fn strip_json_media_fields(
++    text: &str,
++    config: &EmbeddingSanitizationConfig,
++    had_media: &mut bool,
++) -> String {
++    static IMAGE_URL_OBJECT_RE: LazyLock<Regex> = LazyLock::new(|| {
++        Regex::new(r#"(?is)"image_url"\s*:\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"#).unwrap()
++    });
++    static IMAGE_URL_STRING_RE: LazyLock<Regex> =
++        LazyLock::new(|| Regex::new(r#"(?is)"image_url"\s*:\s*"[^"]*""#).unwrap());
++    static BASE64_FIELD_RE: LazyLock<Regex> =
++        LazyLock::new(|| Regex::new(r#"(?is)"(?:base64|data|bytes|raw)"\s*:\s*"[^"]+""#).unwrap());
++
++    let replacement = if config.embed_media_placeholders {
++        "\"text\":\"[image attached]\""
++    } else {
++        ""
++    };
++
++    let mut output = text.to_string();
++    for re in [
++        &*IMAGE_URL_OBJECT_RE,
++        &*IMAGE_URL_STRING_RE,
++        &*BASE64_FIELD_RE,
++    ] {
++        if re.is_match(&output) {
++            *had_media = true;
++            output = re.replace_all(&output, replacement).into_owned();
++        }
++    }
++    output
++}
++
++fn placeholder_for_marker(marker: &str) -> &'static str {
++    match marker.to_ascii_uppercase().as_str() {
++        "VIDEO" => "[video attached]",
++        "VOICE" | "AUDIO" => "[audio attached]",
++        "DOCUMENT" | "FILE" => "[file attached]",
++        _ => "[image attached]",
++    }
++}
++
++fn normalize_embedding_text(text: &str) -> String {
++    let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
++    static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
++    normalized = SPACE_RE.replace_all(&normalized, " ").into_owned();
++
++    let mut lines = Vec::new();
++    for line in normalized.lines() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            if !lines.last().is_some_and(|line: &&str| line.is_empty()) {
++                lines.push("");
++            }
++        } else {
++            lines.push(trimmed);
++        }
++    }
++
++    while lines.last().is_some_and(|line| line.is_empty()) {
++        lines.pop();
++    }
++    lines.join("\n").trim().to_string()
++}
++
++fn truncate_to_chars(text: &str, max_chars: usize) -> String {
++    if max_chars == 0 {
++        return String::new();
++    }
++    if text.chars().count() <= max_chars {
++        return text.to_string();
++    }
++    text.chars().take(max_chars).collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn text_only_message_is_preserved() {
++        let sanitized = sanitize_for_embedding_with_config(
++            "remember the blue notebook",
++            &EmbeddingSanitizationConfig::default(),
++        );
++        assert_eq!(sanitized.text, "remember the blue notebook");
++        assert!(!sanitized.had_media);
++    }
++
++    #[test]
++    fn memory_config_defaults_cover_sanitization_config() {
++        let memory = MemoryConfig::default();
++        let config = EmbeddingSanitizationConfig::from(&memory);
++
++        assert!(!config.embed_media_placeholders);
++        assert!(config.embed_assistant_image_summaries);
++        assert!(config.skip_embedding_for_image_messages);
++        assert_eq!(config.max_text_chars, DEFAULT_EMBEDDING_TEXT_MAX_CHARS);
++    }
++
++    #[test]
++    fn image_only_message_is_skipped_by_default() {
++        let sanitized = sanitize_for_embedding_with_config(
++            "[IMAGE:/tmp/telegram/photo.jpg]",
++            &EmbeddingSanitizationConfig::default(),
++        );
++        assert!(sanitized.had_media);
++        assert!(sanitized.text.is_empty());
++    }
++
++    #[test]
++    fn image_only_message_can_embed_placeholder() {
++        let config = EmbeddingSanitizationConfig {
++            embed_media_placeholders: true,
++            ..EmbeddingSanitizationConfig::default()
++        };
++        let sanitized = sanitize_for_embedding_with_config("[IMAGE:/tmp/photo.jpg]", &config);
++        assert_eq!(sanitized.text, "[image attached]");
++        assert!(sanitized.had_media);
++    }
++
++    #[test]
++    fn text_plus_image_keeps_text_only_by_default() {
++        let sanitized = sanitize_for_embedding_with_config(
++            "[IMAGE:/tmp/photo.jpg]\n\nThis is the valve label.",
++            &EmbeddingSanitizationConfig::default(),
++        );
++        assert_eq!(sanitized.text, "This is the valve label.");
++        assert!(sanitized.had_media);
++    }
++
++    #[test]
++    fn data_uri_and_base64_are_not_embedded() {
++        let input = format!(
++            "before [IMAGE:data:image/png;base64,{}] after",
++            "A".repeat(512)
++        );
++        let sanitized =
++            sanitize_for_embedding_with_config(&input, &EmbeddingSanitizationConfig::default());
++        assert_eq!(sanitized.text, "before after");
++        assert!(!sanitized.text.contains("base64"));
++        assert!(!sanitized.text.contains(&"A".repeat(80)));
++    }
++
++    #[test]
++    fn json_image_url_keeps_text_part_only() {
++        let input = r#"[
++            {"type":"text","text":"what is in this image?"},
++            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
++        ]"#;
++        let sanitized =
++            sanitize_for_embedding_with_config(input, &EmbeddingSanitizationConfig::default());
++        assert_eq!(sanitized.text, "what is in this image?");
++        assert!(sanitized.had_media);
++        assert!(!sanitized.text.contains("image_url"));
++        assert!(!sanitized.text.contains("base64"));
++    }
++
++    #[test]
++    fn assistant_image_summary_fields_follow_config() {
++        let input = r#"{"image_summary":"Assistant identified serial number A17"}"#;
++        let sanitized =
++            sanitize_for_embedding_with_config(input, &EmbeddingSanitizationConfig::default());
++        assert_eq!(sanitized.text, "Assistant identified serial number A17");
++
++        let config = EmbeddingSanitizationConfig {
++            embed_assistant_image_summaries: false,
++            ..EmbeddingSanitizationConfig::default()
++        };
++        let sanitized = sanitize_for_embedding_with_config(input, &config);
++        assert!(sanitized.text.is_empty());
++    }
++
++    #[test]
++    fn telegram_caption_is_safe_text() {
++        let sanitized = sanitize_for_embedding_with_config(
++            "[IMAGE:/home/admin/.zeroclaw/workspace/telegram_files/photo.jpg]\n\nserial number A17",
++            &EmbeddingSanitizationConfig::default(),
++        );
++        assert_eq!(sanitized.text, "serial number A17");
++        assert!(sanitized.had_media);
++    }
++
++    #[test]
++    fn max_text_length_is_enforced_on_char_boundary() {
++        let config = EmbeddingSanitizationConfig {
++            max_text_chars: 4,
++            ..EmbeddingSanitizationConfig::default()
++        };
++        let sanitized = sanitize_for_embedding_with_config("ab\u{1F600}cd", &config);
++        assert_eq!(sanitized.text, "ab\u{1F600}c");
++    }
++}
+diff --git a/crates/zeroclaw-memory/src/embeddings.rs b/crates/zeroclaw-memory/src/embeddings.rs
+index 774a61f..a521b2e 100644
+--- a/crates/zeroclaw-memory/src/embeddings.rs
++++ b/crates/zeroclaw-memory/src/embeddings.rs
+@@ -1,4 +1,10 @@
+ use async_trait::async_trait;
++use std::sync::Arc;
++
++use crate::embedding_safety::{
++    EmbeddingSanitizationConfig, log_embedding_skip_if_media_only,
++    sanitize_for_embedding_with_config,
++};
+ 
+ /// Trait for embedding providers — convert text to vectors
+ #[async_trait]
+@@ -42,6 +48,83 @@ impl EmbeddingProvider for NoopEmbedding {
+ 
+ // ── OpenAI-compatible embedding provider ─────────────────────
+ 
++// Sanitizing provider wrapper.
++pub struct SanitizingEmbeddingProvider {
++    inner: Arc<dyn EmbeddingProvider>,
++    config: EmbeddingSanitizationConfig,
++}
++
++impl SanitizingEmbeddingProvider {
++    pub fn new(inner: Arc<dyn EmbeddingProvider>, config: EmbeddingSanitizationConfig) -> Self {
++        Self { inner, config }
++    }
++}
++
++#[async_trait]
++impl EmbeddingProvider for SanitizingEmbeddingProvider {
++    fn name(&self) -> &str {
++        self.inner.name()
++    }
++
++    fn dimensions(&self) -> usize {
++        self.inner.dimensions()
++    }
++
++    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
++        if texts.is_empty() {
++            return Ok(Vec::new());
++        }
++
++        let sanitized = texts
++            .iter()
++            .map(|text| {
++                let safe = sanitize_for_embedding_with_config(text, &self.config);
++                log_embedding_skip_if_media_only(&safe);
++                safe.text
++            })
++            .collect::<Vec<_>>();
++
++        let mut embeddings = vec![Vec::new(); texts.len()];
++        let mut safe_texts = Vec::new();
++        let mut safe_indices = Vec::new();
++        for (idx, text) in sanitized.iter().enumerate() {
++            if !text.trim().is_empty() {
++                safe_indices.push(idx);
++                safe_texts.push(text.as_str());
++            }
++        }
++
++        if safe_texts.is_empty() {
++            return Ok(embeddings);
++        }
++
++        let safe_embeddings = self.inner.embed(&safe_texts).await?;
++        if safe_embeddings.len() != safe_indices.len() {
++            anyhow::bail!(
++                "embedding provider returned {} vectors for {} sanitized inputs",
++                safe_embeddings.len(),
++                safe_indices.len()
++            );
++        }
++
++        for (idx, embedding) in safe_indices.into_iter().zip(safe_embeddings) {
++            embeddings[idx] = embedding;
++        }
++
++        Ok(embeddings)
++    }
++
++    async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
++        let sanitized = sanitize_for_embedding_with_config(text, &self.config);
++        log_embedding_skip_if_media_only(&sanitized);
++        if sanitized.text.trim().is_empty() {
++            return Ok(Vec::new());
++        }
++        self.inner.embed_one(&sanitized.text).await
++    }
++}
++
++// OpenAI-compatible embedding provider.
+ pub struct OpenAiEmbedding {
+     base_url: String,
+     api_key: String,
+@@ -208,6 +291,56 @@ mod tests {
+         assert!(result.is_empty());
+     }
+ 
++    struct CapturingEmbedding {
++        seen: std::sync::Mutex<Vec<String>>,
++    }
++
++    #[async_trait]
++    impl EmbeddingProvider for CapturingEmbedding {
++        fn name(&self) -> &str {
++            "capture"
++        }
++
++        fn dimensions(&self) -> usize {
++            2
++        }
++
++        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
++            self.seen
++                .lock()
++                .unwrap()
++                .extend(texts.iter().map(|text| (*text).to_string()));
++            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
++        }
++    }
++
++    #[tokio::test]
++    async fn sanitizing_wrapper_keeps_text_and_drops_image_payloads() {
++        let inner = Arc::new(CapturingEmbedding {
++            seen: std::sync::Mutex::new(Vec::new()),
++        });
++        let provider = SanitizingEmbeddingProvider::new(inner.clone(), Default::default());
++        let embedding = provider
++            .embed_one("[IMAGE:data:image/png;base64,AAAA]\n\ncaption text")
++            .await
++            .unwrap();
++
++        assert_eq!(embedding, vec![1.0, 0.0]);
++        assert_eq!(inner.seen.lock().unwrap().as_slice(), ["caption text"]);
++    }
++
++    #[tokio::test]
++    async fn sanitizing_wrapper_skips_media_only_messages() {
++        let inner = Arc::new(CapturingEmbedding {
++            seen: std::sync::Mutex::new(Vec::new()),
++        });
++        let provider = SanitizingEmbeddingProvider::new(inner.clone(), Default::default());
++        let embedding = provider.embed_one("[IMAGE:/tmp/photo.jpg]").await.unwrap();
++
++        assert!(embedding.is_empty());
++        assert!(inner.seen.lock().unwrap().is_empty());
++    }
++
+     #[test]
+     fn factory_none() {
+         let p = create_embedding_provider("none", None, "model", 1536);
+diff --git a/crates/zeroclaw-memory/src/lib.rs b/crates/zeroclaw-memory/src/lib.rs
+index 920faf1..64f6aa8 100644
+--- a/crates/zeroclaw-memory/src/lib.rs
++++ b/crates/zeroclaw-memory/src/lib.rs
+@@ -23,6 +23,7 @@ pub mod conflict;
+ pub mod consolidation;
+ pub mod decay;
+ pub mod embeddings;
++pub mod embedding_safety;
+ pub mod hygiene;
+ pub mod importance;
+ pub mod knowledge_graph;
+@@ -63,6 +64,10 @@ pub use qdrant::QdrantMemory;
+ pub use response_cache::ResponseCache;
+ #[allow(unused_imports)]
+ pub use retrieval::{RetrievalConfig, RetrievalPipeline};
++pub use embedding_safety::{
++    EmbeddingSanitizationConfig, SanitizedEmbeddingText, log_embedding_sanitization,
++    log_embedding_skip_if_media_only, sanitize_for_embedding, sanitize_for_embedding_with_config,
++};
+ pub use sqlite::SqliteMemory;
+ pub use traits::Memory;
+ #[allow(unused_imports)]
+@@ -369,13 +374,18 @@ pub fn create_memory_with_storage_and_routes(
+         workspace_dir: &Path,
+         resolved_embedding: &ResolvedEmbeddingConfig,
+     ) -> anyhow::Result<SqliteMemory> {
+-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
++        let raw_embedder: Arc<dyn embeddings::EmbeddingProvider> =
+             Arc::from(embeddings::create_embedding_provider(
+                 &resolved_embedding.provider,
+                 resolved_embedding.api_key.as_deref(),
+                 &resolved_embedding.model,
+                 resolved_embedding.dimensions,
+             ));
++        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
++            Arc::new(embeddings::SanitizingEmbeddingProvider::new(
++                raw_embedder,
++                EmbeddingSanitizationConfig::from(config),
++            ));
+ 
+         #[allow(clippy::cast_possible_truncation)]
+         let mem = SqliteMemory::with_embedder(
+@@ -411,13 +421,18 @@ pub fn create_memory_with_storage_and_routes(
+             .clone()
+             .or_else(|| std::env::var("QDRANT_API_KEY").ok())
+             .filter(|s| !s.trim().is_empty());
+-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
++        let raw_embedder: Arc<dyn embeddings::EmbeddingProvider> =
+             Arc::from(embeddings::create_embedding_provider(
+                 &resolved_embedding.provider,
+                 resolved_embedding.api_key.as_deref(),
+                 &resolved_embedding.model,
+                 resolved_embedding.dimensions,
+             ));
++        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
++            Arc::new(embeddings::SanitizingEmbeddingProvider::new(
++                raw_embedder,
++                EmbeddingSanitizationConfig::from(config),
++            ));
+         tracing::info!(
+             "📦 Qdrant memory backend configured (url: {}, collection: {})",
+             url,
+diff --git a/crates/zeroclaw-memory/src/qdrant.rs b/crates/zeroclaw-memory/src/qdrant.rs
+index 52bd301..c44f72a 100644
+--- a/crates/zeroclaw-memory/src/qdrant.rs
++++ b/crates/zeroclaw-memory/src/qdrant.rs
+@@ -232,16 +232,19 @@ impl Memory for QdrantMemory {
+         category: MemoryCategory,
+         session_id: Option<&str>,
+     ) -> Result<()> {
+-        self.ensure_initialized().await?;
+-
+         // Generate embedding for the content
+         let combined_text = format!("{}\n{}", key, content);
+         let embedding = self.embedder.embed_one(&combined_text).await?;
+ 
+         if embedding.is_empty() {
+-            anyhow::bail!("Qdrant requires non-zero dimensional embeddings");
++            tracing::info!(
++                "Skipping Qdrant memory store: no text content after media sanitization"
++            );
++            return Ok(());
+         }
+ 
++        self.ensure_initialized().await?;
++
+         let id = Uuid::new_v4().to_string();
+         let timestamp = Utc::now().to_rfc3339();
+ 
+@@ -296,16 +299,22 @@ impl Memory for QdrantMemory {
+             return self.list(None, session_id).await;
+         }
+ 
+-        self.ensure_initialized().await?;
+-
+         // Generate embedding for the query
+         let embedding = self.embedder.embed_one(query).await?;
+ 
+         if embedding.is_empty() {
+-            // Fallback to listing if embeddings aren't available
+-            return self.list(None, session_id).await;
++            if self.embedder.dimensions() == 0 {
++                // Preserve the existing no-embedding-provider fallback behavior.
++                return self.list(None, session_id).await;
++            }
++            tracing::info!(
++                "Skipping Qdrant memory recall: no text content after media sanitization"
++            );
++            return Ok(Vec::new());
+         }
+ 
++        self.ensure_initialized().await?;
++
+         // Build filter for session_id if provided
+         let filter = session_id.map(|sid| {
+             serde_json::json!({
+@@ -578,6 +587,50 @@ impl Memory for QdrantMemory {
+ mod tests {
+     use super::*;
+ 
++    struct EmptyEmbeddingProvider;
++
++    #[async_trait::async_trait]
++    impl EmbeddingProvider for EmptyEmbeddingProvider {
++        fn name(&self) -> &str {
++            "empty"
++        }
++
++        fn dimensions(&self) -> usize {
++            2
++        }
++
++        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
++            Ok(texts.iter().map(|_| Vec::new()).collect())
++        }
++    }
++
++    #[tokio::test]
++    async fn qdrant_store_skips_empty_embedding_without_network() {
++        let mem = QdrantMemory::new_lazy(
++            "http://127.0.0.1:1",
++            "zeroclaw_test",
++            None,
++            Arc::new(EmptyEmbeddingProvider),
++        );
++
++        mem.store("media_only", "[IMAGE:/tmp/photo.jpg]", MemoryCategory::Conversation, None)
++            .await
++            .unwrap();
++    }
++
++    #[tokio::test]
++    async fn qdrant_recall_skips_empty_embedding_without_network() {
++        let mem = QdrantMemory::new_lazy(
++            "http://127.0.0.1:1",
++            "zeroclaw_test",
++            None,
++            Arc::new(EmptyEmbeddingProvider),
++        );
++
++        let entries = mem.recall("[IMAGE:/tmp/photo.jpg]", 5, None).await.unwrap();
++        assert!(entries.is_empty());
++    }
++
+     #[test]
+     fn category_to_str_maps_known_categories() {
+         assert_eq!(QdrantMemory::category_to_str(&MemoryCategory::Core), "core");
+diff --git a/crates/zeroclaw-memory/src/sqlite.rs b/crates/zeroclaw-memory/src/sqlite.rs
+index c4544d3..e5c3927 100644
+--- a/crates/zeroclaw-memory/src/sqlite.rs
++++ b/crates/zeroclaw-memory/src/sqlite.rs
+@@ -311,6 +311,9 @@ impl SqliteMemory {
+ 
+         // Compute embedding (async I/O)
+         let embedding = self.embedder.embed_one(text).await?;
++        if embedding.is_empty() {
++            return Ok(None);
++        }
+         let bytes = vector::vec_to_bytes(&embedding);
+ 
+         // Store in cache + LRU eviction (offloaded to blocking thread)
+@@ -789,6 +792,69 @@ mod tests {
+         (tmp, mem)
+     }
+ 
++    struct EmptyEmbeddingProvider;
++
++    #[async_trait::async_trait]
++    impl EmbeddingProvider for EmptyEmbeddingProvider {
++        fn name(&self) -> &str {
++            "empty"
++        }
++
++        fn dimensions(&self) -> usize {
++            2
++        }
++
++        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
++            Ok(texts.iter().map(|_| Vec::new()).collect())
++        }
++    }
++
++    struct FixedEmbeddingProvider;
++
++    #[async_trait::async_trait]
++    impl EmbeddingProvider for FixedEmbeddingProvider {
++        fn name(&self) -> &str {
++            "fixed"
++        }
++
++        fn dimensions(&self) -> usize {
++            2
++        }
++
++        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
++            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
++        }
++    }
++
++    fn temp_sqlite_with_embedder(
++        embedder: Arc<dyn EmbeddingProvider>,
++    ) -> (TempDir, SqliteMemory) {
++        let tmp = TempDir::new().unwrap();
++        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 10_000, None)
++            .unwrap();
++        (tmp, mem)
++    }
++
++    #[tokio::test]
++    async fn sqlite_store_skips_empty_embedding_safely() {
++        let (_tmp, mem) = temp_sqlite_with_embedder(Arc::new(EmptyEmbeddingProvider));
++        mem.store("media", "[IMAGE:/tmp/photo.jpg]", MemoryCategory::Conversation, None)
++            .await
++            .unwrap();
++
++        assert_eq!(mem.count().await.unwrap(), 1);
++        assert_eq!(mem.get("media").await.unwrap().unwrap().content, "[IMAGE:/tmp/photo.jpg]");
++    }
++
++    #[tokio::test]
++    async fn sqlite_text_input_stores_with_normal_embedding() {
++        let (_tmp, mem) = temp_sqlite_with_embedder(Arc::new(FixedEmbeddingProvider));
++        mem.store("text", "Rust vector memory", MemoryCategory::Core, None)
++            .await
++            .unwrap();
++        assert_eq!(mem.recall("Rust vector memory", 5, None).await.unwrap().len(), 1);
++    }
++
+     #[tokio::test]
+     async fn sqlite_name() {
+         let (_tmp, mem) = temp_sqlite();
+diff --git a/crates/zeroclaw-runtime/src/agent/loop_.rs b/crates/zeroclaw-runtime/src/agent/loop_.rs
+index ac747b7..b43b24c 100644
+--- a/crates/zeroclaw-runtime/src/agent/loop_.rs
++++ b/crates/zeroclaw-runtime/src/agent/loop_.rs
+@@ -81,6 +81,17 @@ pub use super::history::{
+ /// Matches the channel-side constant in `channels/mod.rs`.
+ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+ 
++fn sanitize_memory_text(
++    message: &str,
++    memory_config: &zeroclaw_config::schema::MemoryConfig,
++) -> String {
++    let sanitize_config = zeroclaw_memory::EmbeddingSanitizationConfig::from(memory_config);
++    let sanitized =
++        zeroclaw_memory::sanitize_for_embedding_with_config(message, &sanitize_config);
++    zeroclaw_memory::log_embedding_skip_if_media_only(&sanitized);
++    sanitized.text
++}
++
+ /// Callback type for checking if model has been switched during tool execution.
+ /// Returns Some((provider, model)) if a switch was requested, None otherwise.
+ pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
+@@ -348,6 +359,9 @@ async fn build_context(
+     exclude_conversation: bool,
+ ) -> String {
+     let mut context = String::new();
++    if user_msg.trim().is_empty() {
++        return context;
++    }
+ 
+     // Pull relevant memories for this message
+     if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None).await {
+@@ -2534,16 +2548,18 @@ pub async fn run(
+             system_prompt = format!("{prefix}\n\n{system_prompt}");
+         }
+ 
++        let memory_text = sanitize_memory_text(&effective_msg, &config.memory);
++
+         // Auto-save user message to memory (skip short/trivial messages)
+         if config.memory.auto_save
+-            && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+-            && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
++            && memory_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
++            && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
+         {
+             let user_key = autosave_memory_key("user_msg");
+             let _ = mem
+                 .store(
+                     &user_key,
+-                    &effective_msg,
++                    &memory_text,
+                     MemoryCategory::Conversation,
+                     memory_session_id.as_deref(),
+                 )
+@@ -2556,7 +2572,7 @@ pub async fn run(
+         // into autonomous executions. See #5415 / #5456.
+         let mem_context = build_context(
+             mem.as_ref(),
+-            &effective_msg,
++            &memory_text,
+             config.memory.min_relevance_score,
+             memory_session_id.as_deref(),
+             !interactive,
+@@ -2825,16 +2841,18 @@ pub async fn run(
+                 }
+             }
+ 
++            let memory_text = sanitize_memory_text(&effective_input, &config.memory);
++
+             // Auto-save conversation turns (skip short/trivial messages)
+             if config.memory.auto_save
+-                && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+-                && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
++                && memory_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
++                && !zeroclaw_memory::should_skip_autosave_content(&memory_text)
+             {
+                 let user_key = autosave_memory_key("user_msg");
+                 let _ = mem
+                     .store(
+                         &user_key,
+-                        &effective_input,
++                        &memory_text,
+                         MemoryCategory::Conversation,
+                         memory_session_id.as_deref(),
+                     )
+@@ -2846,7 +2864,7 @@ pub async fn run(
+             // chatting in this session and may want their own history recalled).
+             let mem_context = build_context(
+                 mem.as_ref(),
+-                &effective_input,
++                &memory_text,
+                 config.memory.min_relevance_score,
+                 memory_session_id.as_deref(),
+                 false,
+@@ -3429,12 +3447,13 @@ pub async fn process_message(
+     }
+ 
+     let effective_msg_ref = effective_message.as_str();
++    let memory_text = sanitize_memory_text(effective_msg_ref, &config.memory);
+     // process_message is the channel entrypoint (Discord, Telegram, gateway,
+     // etc.) — recall is scoped to the channel's session_id, so retrieving the
+     // user's own Conversation history within their session is intended.
+     let mem_context = build_context(
+         mem.as_ref(),
+-        effective_msg_ref,
++        &memory_text,
+         config.memory.min_relevance_score,
+         session_id,
+         false,

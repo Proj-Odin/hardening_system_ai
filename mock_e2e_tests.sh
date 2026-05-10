@@ -69,6 +69,10 @@ shell_scripts=(
     setup_v1.5.sh
     test_ssh_port_detection.sh
     test_docker_package_flow.sh
+    test_zeroclaw_embedding_safety_verifier.sh
+    scripts/configure-zeroclaw-safe-embeddings.sh
+    scripts/patch-zeroclaw-sanitize-embeddings.sh
+    scripts/verify-zeroclaw-embedding-safety.sh
     scripts/setup-litellm-gateway.sh
     scripts/update-litellm-gateway.sh
     scripts/verify-litellm-gateway.sh
@@ -104,7 +108,11 @@ echo "[TEST 4] Docker Package Flow Regression"
 run_logged "test_docker_package_flow.sh" bash "${REPO_ROOT}/test_docker_package_flow.sh"
 
 echo ""
-echo "[TEST 5] Legacy Guardrail"
+echo "[TEST 5] ZeroClaw Embedding Verifier Timeout Regression"
+run_logged "test_zeroclaw_embedding_safety_verifier.sh" bash "${REPO_ROOT}/test_zeroclaw_embedding_safety_verifier.sh"
+
+echo ""
+echo "[TEST 6] Legacy Guardrail"
 if bash "${REPO_ROOT}/declawer_v1.0.sh" >> "${ARTIFACT_LOG}" 2>&1; then
     fail_test "declawer_v1.0.sh fail-closed" "expected exit code 1"
 else
@@ -117,7 +125,7 @@ else
 fi
 
 echo ""
-echo "[TEST 6] Cloud TODO Structure"
+echo "[TEST 7] Cloud TODO Structure"
 todo_headings=(
     '^## Goals$'
     '^## What Is Already Covered Locally$'
@@ -140,7 +148,7 @@ else
 fi
 
 echo ""
-echo "[TEST 7] Ignore Rules"
+echo "[TEST 8] Ignore Rules"
 ignore_pass=0
 grep -Eq '^__pycache__/\r?$' "${REPO_ROOT}/.gitignore" && ignore_pass=$((ignore_pass + 1))
 grep -Eq '^test-run-\*/\r?$' "${REPO_ROOT}/.gitignore" && ignore_pass=$((ignore_pass + 1))
@@ -152,7 +160,7 @@ else
 fi
 
 echo ""
-echo "[TEST 8] README Validation Notes"
+echo "[TEST 9] README Validation Notes"
 readme_checks=0
 grep -q 'verify_hardening_sync.py' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'test_ssh_port_detection.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
