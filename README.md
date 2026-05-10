@@ -91,6 +91,12 @@ Docker Compose v2 is checked before install. The script installs `docker-compose
 
 Ubuntu 25.x handling is codename-driven. Ubuntu 25.10 (`questing`) uses the official Docker repository when Docker publishes matching repository metadata; Ubuntu 25.04 (`plucky`) falls back to distro Docker packages instead of writing an unsupported Docker repository entry when official metadata is unavailable.
 
+## Proxmox / QEMU Guest Agent
+
+The base security step can install and enable `qemu-guest-agent` for full Proxmox/QEMU VMs. The option defaults to yes when virtualization detection reports `kvm` or `qemu`, defaults to no elsewhere, and is skipped for LXC/container targets.
+
+On Debian/Ubuntu, the script installs `qemu-guest-agent` when available and enables `qemu-guest-agent.service`. On Alpine VM targets, it installs `qemu-guest-agent` plus `qemu-guest-agent-openrc` when OpenRC is detected, then enables the `qemu-guest-agent` service. This does not open firewall ports. In Proxmox, also enable **QEMU Guest Agent** in the VM options.
+
 ## Checkmk Integration (All Profiles)
 
 The hardening script includes an optional Checkmk stage for every profile.
@@ -122,6 +128,7 @@ For Alpine:
 - SSH password authentication stays available by default until key login is verified; rerun the hardening script after testing keys to disable passwords
 - Debian/Ubuntu SSH keeps `UsePAM yes` for PAM account/session processing while disabling keyboard-interactive auth separately
 - Optional SSH rate limiting in both SSH and UFW flow
+- Optional QEMU guest agent install for Proxmox/QEMU VMs; skipped for LXC/container targets
 - Root SSH login disable option
 - Password SSH disable option only when key material is detected
 - Optional Fail2Ban (recommended)
@@ -268,6 +275,7 @@ sudo /opt/litellm-gateway/backup-litellm-gateway.sh
 
 - Run `python verify_hardening_sync.py` after shared Debian/Alpine changes to catch drift between the two scripts.
 - Run `bash test_ssh_port_detection.sh` and `bash test_ssh_hardening_config.sh` after touching SSH detection, validation, or login-policy logic.
+- Run `bash test_qemu_guest_agent_flow.sh` after touching Proxmox/QEMU guest-agent logic.
 - Run `bash mock_e2e_tests.sh` for a lightweight repo-level smoke check. It writes local artifacts to ignored `test-run-<timestamp>/` directories.
 - Track real cloud test work in `TODO_CLOUD_E2E.md`. Generated cloud or mock run artifacts should stay local and uncommitted.
 

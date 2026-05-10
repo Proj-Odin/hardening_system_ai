@@ -69,6 +69,7 @@ shell_scripts=(
     setup_v1.5.sh
     test_ssh_port_detection.sh
     test_ssh_hardening_config.sh
+    test_qemu_guest_agent_flow.sh
     test_docker_package_flow.sh
     test_zeroclaw_embedding_safety_verifier.sh
     scripts/configure-zeroclaw-safe-embeddings.sh
@@ -106,15 +107,19 @@ run_logged "test_ssh_port_detection.sh" bash "${REPO_ROOT}/test_ssh_port_detecti
 run_logged "test_ssh_hardening_config.sh" bash "${REPO_ROOT}/test_ssh_hardening_config.sh"
 
 echo ""
-echo "[TEST 4] Docker Package Flow Regression"
+echo "[TEST 4] Proxmox/QEMU Guest Agent Regression"
+run_logged "test_qemu_guest_agent_flow.sh" bash "${REPO_ROOT}/test_qemu_guest_agent_flow.sh"
+
+echo ""
+echo "[TEST 5] Docker Package Flow Regression"
 run_logged "test_docker_package_flow.sh" bash "${REPO_ROOT}/test_docker_package_flow.sh"
 
 echo ""
-echo "[TEST 5] ZeroClaw Embedding Verifier Timeout Regression"
+echo "[TEST 6] ZeroClaw Embedding Verifier Timeout Regression"
 run_logged "test_zeroclaw_embedding_safety_verifier.sh" bash "${REPO_ROOT}/test_zeroclaw_embedding_safety_verifier.sh"
 
 echo ""
-echo "[TEST 6] Legacy Guardrail"
+echo "[TEST 7] Legacy Guardrail"
 if bash "${REPO_ROOT}/declawer_v1.0.sh" >> "${ARTIFACT_LOG}" 2>&1; then
     fail_test "declawer_v1.0.sh fail-closed" "expected exit code 1"
 else
@@ -127,7 +132,7 @@ else
 fi
 
 echo ""
-echo "[TEST 7] Cloud TODO Structure"
+echo "[TEST 8] Cloud TODO Structure"
 todo_headings=(
     '^## Goals$'
     '^## What Is Already Covered Locally$'
@@ -150,7 +155,7 @@ else
 fi
 
 echo ""
-echo "[TEST 8] Ignore Rules"
+echo "[TEST 9] Ignore Rules"
 ignore_pass=0
 grep -Eq '^__pycache__/\r?$' "${REPO_ROOT}/.gitignore" && ignore_pass=$((ignore_pass + 1))
 grep -Eq '^test-run-\*/\r?$' "${REPO_ROOT}/.gitignore" && ignore_pass=$((ignore_pass + 1))
@@ -162,17 +167,18 @@ else
 fi
 
 echo ""
-echo "[TEST 9] README Validation Notes"
+echo "[TEST 10] README Validation Notes"
 readme_checks=0
 grep -q 'verify_hardening_sync.py' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'test_ssh_port_detection.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'test_ssh_hardening_config.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
+grep -q 'test_qemu_guest_agent_flow.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'mock_e2e_tests.sh' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
 grep -q 'TODO_CLOUD_E2E.md' "${REPO_ROOT}/README.md" && readme_checks=$((readme_checks + 1))
-if [[ "${readme_checks}" -eq 5 ]]; then
-    pass_test "README validation references" "5/5"
+if [[ "${readme_checks}" -eq 6 ]]; then
+    pass_test "README validation references" "6/6"
 else
-    fail_test "README validation references" "${readme_checks}/5"
+    fail_test "README validation references" "${readme_checks}/6"
 fi
 
 echo ""

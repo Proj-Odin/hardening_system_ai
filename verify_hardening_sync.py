@@ -54,6 +54,7 @@ ALLOWED_SHARED_DIFFS = {
     "apply_checkmk",
     "apply_fail2ban",
     "apply_profile_specific",
+    "apply_qemu_guest_agent",
     "apply_ssh_hardening",
     "apply_tailscale_gateway_profile",
     "apply_tailscale_strong_admin_controls",
