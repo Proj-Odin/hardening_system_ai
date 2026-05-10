@@ -1038,7 +1038,8 @@ Recommended policy:
    - api.openai.com
    - api.anthropic.com
    - generativelanguage.googleapis.com
-4. Allow local Ollama/vLLM destinations explicitly.
+3
++4. Allow local Ollama/vLLM destinations explicitly.
 5. Deny all other outbound internet from this VM.
 
 Refresh cadence: at least daily, and before provider changes.
