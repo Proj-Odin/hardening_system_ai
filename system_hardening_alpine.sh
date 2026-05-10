@@ -74,6 +74,7 @@ PROFILE_LAN_SOURCE=""
 INSTALL_FAIL2BAN=1
 ENABLE_APPARMOR=1
 UPDATE_MODE="notify" # notify|unattended|manual
+INSTALL_QEMU_GUEST_AGENT=0
 
 INSTALL_CHECKMK=0
 CHECKMK_SOURCE="manual" # manual|apk-url|already
@@ -493,6 +494,49 @@ detect_ssh_port() {
     echo "22"
 }
 
+detect_virtualization() {
+    local detected="unknown"
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        detected="$(systemd-detect-virt 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${detected}" || "${detected}" == "none" ]]; then
+        detected="unknown"
+        if grep -qaE 'container=lxc|lxc' /proc/1/environ 2>/dev/null || \
+           grep -qaE '(^|/)lxc(/|$)' /proc/1/cgroup 2>/dev/null || \
+           [[ -f /dev/lxc ]]; then
+            detected="lxc"
+        elif grep -qaE '(^|/)docker(/|$)|(^|/)kubepods(/|$)' /proc/1/cgroup 2>/dev/null || \
+             [[ -f /.dockerenv ]] || \
+             { [[ -r /proc/1/environ ]] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container='; }; then
+            detected="container"
+        fi
+    fi
+
+    echo "${detected}"
+}
+
+is_lxc_or_container() {
+    [[ "${DEPLOYMENT_TARGET:-}" == "lxc" || "${DETECTED_VIRT:-unknown}" == "lxc" || "${DETECTED_VIRT:-unknown}" == "container" ]]
+}
+
+qemu_guest_agent_default() {
+    if is_lxc_or_container; then
+        echo "n"
+        return
+    fi
+
+    case "${DETECTED_VIRT:-unknown}" in
+        kvm|qemu)
+            echo "y"
+            ;;
+        *)
+            echo "n"
+            ;;
+    esac
+}
+
 detect_environment() {
     # /etc/os-release is the canonical source for distro detection.
     if [[ -f /etc/os-release ]]; then
@@ -517,19 +561,7 @@ detect_environment() {
         INIT_SYSTEM="none"
     fi
 
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        DETECTED_VIRT="$(systemd-detect-virt 2>/dev/null || true)"
-    fi
-    if [[ -z "${DETECTED_VIRT}" || "${DETECTED_VIRT}" == "none" ]]; then
-        DETECTED_VIRT="unknown"
-        if grep -qaE 'container=lxc|lxc' /proc/1/environ 2>/dev/null || \
-           grep -qaE '(^|/)lxc(/|$)' /proc/1/cgroup 2>/dev/null || \
-           [[ -f /dev/lxc ]]; then
-            DETECTED_VIRT="lxc"
-        elif grep -qaE '(^|/)docker(/|$)|(^|/)kubepods(/|$)' /proc/1/cgroup 2>/dev/null || [[ -f /.dockerenv ]]; then
-            DETECTED_VIRT="container"
-        fi
-    fi
+    DETECTED_VIRT="$(detect_virtualization)"
 
     if [[ "${INIT_SYSTEM}" == "systemd" ]] && systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "sshd.service"; then
         SSH_SERVICE="sshd"
@@ -1738,6 +1770,27 @@ configure_unattended_upgrades() {
     esac
 }
 
+configure_qemu_guest_agent() {
+    local default_choice=""
+
+    if is_lxc_or_container; then
+        INSTALL_QEMU_GUEST_AGENT=0
+        log "Skipping QEMU guest agent prompt for LXC/container target (${DETECTED_VIRT:-unknown})."
+        return
+    fi
+
+    default_choice="$(qemu_guest_agent_default)"
+    if prompt_yes_no "Install/enable Proxmox/QEMU guest agent? (VM only)" "${default_choice}"; then
+        INSTALL_QEMU_GUEST_AGENT=1
+        add_warning "QEMU guest agent selected. In Proxmox, also enable 'QEMU Guest Agent' in the VM options."
+        if [[ "${DETECTED_VIRT:-unknown}" != "kvm" && "${DETECTED_VIRT:-unknown}" != "qemu" && "${DETECTED_VIRT:-unknown}" != "unknown" ]]; then
+            add_warning "QEMU guest agent selected while virtualization detection reports '${DETECTED_VIRT}'. Confirm this host is a QEMU/KVM VM."
+        fi
+    else
+        INSTALL_QEMU_GUEST_AGENT=0
+    fi
+}
+
 configure_base_security() {
     # Base security module groups host-wide controls (not role-specific services).
     echo
@@ -2002,6 +2055,9 @@ build_change_plan_preview() {
     if [[ "${ENABLE_APPARMOR}" -eq 1 ]]; then
         add_planned_service "apparmor (enable/start if available)"
     fi
+    if [[ "${INSTALL_QEMU_GUEST_AGENT}" -eq 1 ]]; then
+        add_planned_service "qemu-guest-agent (enable/start)"
+    fi
 
     if flag_enabled "${DISABLE_IPV6}"; then
         add_planned_file "/etc/sysctl.d/99-disable-ipv6.conf"
@@ -2084,6 +2140,7 @@ show_summary() {
     echo "Profile description:     ${PROFILE_DESCRIPTIONS[${PROFILE}]}"
     echo "Distribution:            ${DISTRO} ${DISTRO_VERSION} (${DISTRO_CODENAME:-unknown})"
     echo "Init system:             ${INIT_SYSTEM}"
+    echo "Virtualization:          ${DETECTED_VIRT}"
     echo "SSH service:             ${SSH_SERVICE}"
     echo "Log file:                ${LOGFILE}"
     echo "Backup directory:        ${BACKUP_DIR}"
@@ -3261,6 +3318,41 @@ EOF
     esac
 }
 
+apply_qemu_guest_agent() {
+    local -a qemu_guest_packages=(qemu-guest-agent)
+
+    if [[ "${INSTALL_QEMU_GUEST_AGENT}" -ne 1 ]]; then
+        return 0
+    fi
+
+    if is_lxc_or_container; then
+        warn "Skipping qemu-guest-agent on LXC/container target (${DETECTED_VIRT:-unknown}); it is intended for full QEMU/KVM VMs."
+        return 0
+    fi
+
+    if [[ "${INIT_SYSTEM}" == "openrc" ]]; then
+        qemu_guest_packages+=(qemu-guest-agent-openrc)
+    fi
+
+    log "Installing QEMU guest agent packages: ${qemu_guest_packages[*]}"
+    if ! apk add "${qemu_guest_packages[@]}"; then
+        warn "Failed to install QEMU guest agent packages. Continuing without Proxmox/QEMU guest agent support."
+        return 1
+    fi
+
+    if service_exists "qemu-guest-agent"; then
+        if enable_service_now "qemu-guest-agent"; then
+            log "qemu-guest-agent enabled and started. Ensure QEMU Guest Agent is enabled in Proxmox VM options."
+        else
+            warn "Failed to enable/start qemu-guest-agent. Confirm the package installed and QEMU Guest Agent is enabled in Proxmox VM options."
+            return 1
+        fi
+    else
+        warn "qemu-guest-agent service was not found after package install. Confirm Alpine community repo access and start the service manually if needed."
+        return 1
+    fi
+}
+
 apply_profile_specific() {
     # Role-specific runtime/config work that does not belong to global modules.
     case "${PROFILE}" in
@@ -3352,6 +3444,7 @@ apply_all_changes() {
     apply_update_mode
     apply_ipv6_disable
     apply_checkmk
+    apply_qemu_guest_agent || true
     apply_profile_specific
 
     log "Hardening apply phase complete"
@@ -3386,6 +3479,11 @@ print_post_apply() {
     fi
     if [[ "${INSTALL_CHECKMK}" -eq 1 && "${CHECKMK_COMM_MODE}" == "tls" ]]; then
         echo "${next_step}) Complete Checkmk TLS registration (cmk-agent-ctl register)."
+        next_step="$((next_step + 1))"
+    fi
+    if [[ "${INSTALL_QEMU_GUEST_AGENT}" -eq 1 ]]; then
+        echo "${next_step}) In Proxmox VM options, confirm QEMU Guest Agent is enabled; then check guest-agent status from Proxmox."
+        next_step="$((next_step + 1))"
     fi
     if [[ "${INSTALL_ZEROCLAW}" -eq 1 ]]; then
         echo

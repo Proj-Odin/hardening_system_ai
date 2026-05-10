@@ -120,6 +120,7 @@ For Alpine:
 - SSH password authentication stays available by default until key login is verified; rerun the hardening script after testing keys to disable passwords
 - Debian/Ubuntu SSH keeps `UsePAM yes` for PAM account/session processing while disabling keyboard-interactive auth separately
 - Optional SSH rate limiting in both SSH and UFW flow
+- Optional QEMU guest agent install for Proxmox/QEMU VMs; skipped for LXC/container targets
 - Root SSH login disable option
 - Password SSH disable option only when key material is detected
 - Optional Fail2Ban (recommended)

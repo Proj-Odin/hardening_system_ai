@@ -22,6 +22,7 @@ DISTRO_PRETTY_NAME=""
 DISTRO_ID_LIKE=""
 SSH_SERVICE=""
 CURRENT_SSH_PORT="22"
+DETECTED_VIRT="unknown"
 
 LOG_DIR="/var/log/homelab-hardening"
 BACKUP_ROOT="/var/backups/homelab-hardening"
@@ -69,6 +70,7 @@ PROFILE_LAN_SOURCE=""
 INSTALL_FAIL2BAN=1
 ENABLE_APPARMOR=1
 UPDATE_MODE="notify" # notify|unattended|manual
+INSTALL_QEMU_GUEST_AGENT=0
 
 INSTALL_CHECKMK=0
 CHECKMK_SOURCE="apt" # apt|deb-url|already
@@ -534,6 +536,7 @@ detect_environment() {
         SSH_SERVICE="ssh"
     fi
 
+    DETECTED_VIRT="$(detect_virtualization)"
     CURRENT_SSH_PORT="$(detect_ssh_port)"
     SSH_PORT="${CURRENT_SSH_PORT}"
 
@@ -543,6 +546,7 @@ detect_environment() {
         log "Detected distribution: ${DISTRO} ${DISTRO_VERSION}"
     fi
     log "Detected codename: ${DISTRO_CODENAME:-unknown}"
+    log "Detected virtualization: ${DETECTED_VIRT}"
     log "SSH service name: ${SSH_SERVICE}"
     log "Current SSH port: ${CURRENT_SSH_PORT}"
 }
@@ -1593,6 +1597,27 @@ configure_unattended_upgrades() {
     esac
 }
 
+configure_qemu_guest_agent() {
+    local default_choice=""
+
+    if is_lxc_or_container; then
+        INSTALL_QEMU_GUEST_AGENT=0
+        log "Skipping QEMU guest agent prompt for LXC/container target (${DETECTED_VIRT:-unknown})."
+        return
+    fi
+
+    default_choice="$(qemu_guest_agent_default)"
+    if prompt_yes_no "Install/enable Proxmox/QEMU guest agent? (VM only)" "${default_choice}"; then
+        INSTALL_QEMU_GUEST_AGENT=1
+        add_warning "QEMU guest agent selected. In Proxmox, also enable 'QEMU Guest Agent' in the VM options."
+        if [[ "${DETECTED_VIRT:-unknown}" != "kvm" && "${DETECTED_VIRT:-unknown}" != "qemu" && "${DETECTED_VIRT:-unknown}" != "unknown" ]]; then
+            add_warning "QEMU guest agent selected while virtualization detection reports '${DETECTED_VIRT}'. Confirm this host is a QEMU/KVM VM."
+        fi
+    else
+        INSTALL_QEMU_GUEST_AGENT=0
+    fi
+}
+
 configure_base_security() {
     # Base security module groups host-wide controls (not role-specific services).
     echo
@@ -1855,6 +1880,9 @@ build_change_plan_preview() {
     if [[ "${ENABLE_APPARMOR}" -eq 1 ]]; then
         add_planned_service "apparmor (enable/start if available)"
     fi
+    if [[ "${INSTALL_QEMU_GUEST_AGENT}" -eq 1 ]]; then
+        add_planned_service "qemu-guest-agent (enable/start)"
+    fi
 
     if flag_enabled "${DISABLE_IPV6}"; then
         add_planned_file "/etc/sysctl.d/99-disable-ipv6.conf"
@@ -1926,6 +1954,7 @@ show_summary() {
     echo "Profile:                 ${PROFILE}"
     echo "Profile description:     ${PROFILE_DESCRIPTIONS[${PROFILE}]}"
     echo "Distribution:            ${DISTRO} ${DISTRO_VERSION} (${DISTRO_CODENAME:-unknown})"
+    echo "Virtualization:          ${DETECTED_VIRT}"
     echo "SSH service:             ${SSH_SERVICE}"
     echo "Log file:                ${LOGFILE}"
     echo "Backup directory:        ${BACKUP_DIR}"
@@ -3019,6 +3048,39 @@ EOF
     esac
 }
 
+apply_qemu_guest_agent() {
+    if [[ "${INSTALL_QEMU_GUEST_AGENT}" -ne 1 ]]; then
+        return 0
+    fi
+
+    if is_lxc_or_container; then
+        warn "Skipping qemu-guest-agent on LXC/container target (${DETECTED_VIRT:-unknown}); it is intended for full QEMU/KVM VMs."
+        return 0
+    fi
+
+    if ! dpkg -s qemu-guest-agent >/dev/null 2>&1; then
+        if ! apt_package_available "qemu-guest-agent"; then
+            warn "qemu-guest-agent package is unavailable from configured apt repositories; skipping Proxmox/QEMU guest agent install."
+            return 1
+        fi
+
+        log "Installing qemu-guest-agent"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent; then
+            warn "Failed to install qemu-guest-agent. Continuing without Proxmox/QEMU guest agent support."
+            return 1
+        fi
+    else
+        log "qemu-guest-agent already installed"
+    fi
+
+    if systemctl enable --now qemu-guest-agent; then
+        log "qemu-guest-agent enabled and started. Ensure QEMU Guest Agent is enabled in Proxmox VM options."
+    else
+        warn "Failed to enable/start qemu-guest-agent. Confirm the package installed and QEMU Guest Agent is enabled in Proxmox VM options."
+        return 1
+    fi
+}
+
 apply_profile_specific() {
     # Role-specific runtime/config work that does not belong to global modules.
     case "${PROFILE}" in
@@ -3107,6 +3169,7 @@ apply_all_changes() {
     apply_update_mode
     apply_ipv6_disable
     apply_checkmk
+    apply_qemu_guest_agent || true
     apply_profile_specific
 
     log "Hardening apply phase complete"
